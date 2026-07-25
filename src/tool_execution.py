@@ -639,6 +639,7 @@ async def execute_tool_block(
         authorization = run_policy.authorize(
             getattr(block, "tool_type", None),
             security_context,
+            getattr(block, "content", None),
         )
         if authorization.outcome is AuthorizationOutcome.REQUIRE_APPROVAL:
             return (
@@ -658,7 +659,10 @@ async def execute_tool_block(
             )
         execution_profile = run_policy.execution_profile
     elif security_context is not None and not approval_claimed:
-        decision = security_context.decision_for(getattr(block, "tool_type", None))
+        decision = security_context.decision_for(
+            getattr(block, "tool_type", None),
+            getattr(block, "content", None),
+        )
         if not decision.allowed:
             logger.warning(
                 "External-context policy blocked tool=%r",
@@ -684,6 +688,7 @@ async def execute_tool_block(
             security_context.observe_tool_result(
                 getattr(block, "tool_type", None),
                 output[1],
+                getattr(block, "content", None),
             )
         return output
     finally:

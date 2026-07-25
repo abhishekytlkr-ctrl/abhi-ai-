@@ -18,7 +18,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from src.agent_run_policy import AgentRunMode, parse_agent_run_mode
-from src.tool_capabilities import ToolCapabilities, capabilities_for_tool
+from src.tool_capabilities import (
+    ToolCapabilities,
+    ToolRunSecurityContext,
+    capabilities_for_action,
+)
 
 
 DEFAULT_APPROVAL_TTL_SECONDS = 10 * 60
@@ -53,7 +57,7 @@ def _binding_payload(
     content: Any,
     workspace: Any,
     security_mode: Any,
-    external_untrusted_context_seen: bool,
+    provenance: tuple[str, ...],
     effects: tuple[str, ...],
 ) -> dict[str, Any]:
     return {
@@ -64,7 +68,7 @@ def _binding_payload(
         "content": str(content or ""),
         "workspace": _normalized_workspace(workspace),
         "security_mode": parse_agent_run_mode(security_mode).value,
-        "external_untrusted_context_seen": bool(external_untrusted_context_seen),
+        "provenance": list(provenance),
         "effects": list(effects),
     }
 
@@ -79,7 +83,7 @@ class PendingToolApproval:
     content: str
     workspace: str
     security_mode: AgentRunMode
-    external_untrusted_context_seen: bool
+    provenance: tuple[str, ...]
     effects: tuple[str, ...]
     digest: str
     created_at: float
@@ -138,7 +142,7 @@ class ExactToolApproval:
         current_effects = tuple(
             sorted(
                 effect.value
-                for effect in capabilities_for_tool(tool_name).effects
+                for effect in capabilities_for_action(tool_name, content).effects
             )
         )
         if current_effects != self.pending.effects:
@@ -151,7 +155,7 @@ class ExactToolApproval:
             content=content,
             workspace=workspace,
             security_mode=security_mode,
-            external_untrusted_context_seen=self.pending.external_untrusted_context_seen,
+            provenance=self.pending.provenance,
             effects=self.pending.effects,
         )
         return _canonical_digest(expected) == self.pending.digest
@@ -228,7 +232,7 @@ class ToolApprovalStore:
         content: Any,
         workspace: Any,
         security_mode: Any,
-        external_untrusted_context_seen: bool,
+        security_context: ToolRunSecurityContext,
         capabilities: ToolCapabilities,
     ) -> PendingToolApproval:
         now = time.time()
@@ -241,7 +245,7 @@ class ToolApprovalStore:
             content=content,
             workspace=workspace,
             security_mode=security_mode,
-            external_untrusted_context_seen=external_untrusted_context_seen,
+            provenance=security_context.to_provenance().labels(),
             effects=effects,
         )
         pending = PendingToolApproval(
@@ -253,7 +257,7 @@ class ToolApprovalStore:
             content=payload["content"],
             workspace=payload["workspace"],
             security_mode=parse_agent_run_mode(payload["security_mode"]),
-            external_untrusted_context_seen=payload["external_untrusted_context_seen"],
+            provenance=tuple(payload["provenance"]),
             effects=effects,
             digest=_canonical_digest(payload),
             created_at=now,

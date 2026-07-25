@@ -53,22 +53,33 @@ The agent may be running in a non-admin user's session, but tool dispatch first 
 
 ## Prompt-Injection Hardening
 
-External content that reaches the LLM is treated as untrusted via `src/prompt_security.py`:
+Content provenance has two independent dimensions:
 
-- `untrusted_context_message(label, content)` wraps the content in a `user`-role message with a header block instructing the model not to follow instructions inside it. Content goes in as data, not as a system instruction.
+- **Integrity origin:** system, Odysseus-stored/user-editable, workspace/PR, or external.
+- **Sensitivity:** public, workspace, or private.
+
+External, workspace/PR, and Odysseus-stored content are all untrusted as instructions. Private is not an integrity claim; it means later egress can disclose user data even when the content itself is benign.
+
+Content that reaches the LLM is labelled via `src/prompt_security.py`:
+
+- `untrusted_context_message(label, content, origin=..., sensitivity=...)` wraps content in a `user`-role message with server-owned provenance metadata and a header block instructing the model not to follow instructions inside it. Content goes in as data, not as a system instruction.
 - `UNTRUSTED_CONTEXT_POLICY` is a system-prompt preamble that states the same policy at the top of every session where untrusted data may appear.
 
 **Untrusted surfaces that must go through this wrapper:** web search results, fetched URLs, emails (read), saved memories, skill text, notes, and any tool output sourced from outside the server. Injecting untrusted content directly into the system role is a security bug.
+
+The thread maintains monotonic `external`, `workspace`, `Odysseus`, and `private` observations in the database. Switching models, starting a later turn, teacher takeover, reloading the browser, or forking the conversation cannot clear them. Agent mode does not ambiently retrieve saved memories or personal-document RAG; those private reads go through exact tool approval. Directly opened documents, emails, and uploads are explicit selections and are labelled before the model sees them.
 
 ### Agent Run Authority
 
 Model output requests an action; it does not authorize one. `src/tool_capabilities.py` classifies each built-in tool's effects and result integrity, while `src/agent_run_policy.py` combines those fixed classifications with the thread's server-owned security mode:
 
 - **Ask:** public and workspace observation can proceed, but private reads, writes, code execution, egress, external side effects, UI effects, admin changes, destructive actions, and unknown tools require an exact approval.
-- **Sandbox (default):** code execution stays inside the workspace sandbox. Network egress, external side effects, admin changes, and destructive actions always require an exact approval. Once external untrusted context has influenced the run, any later high-impact action also requires approval.
+- **Sandbox (default):** code execution stays inside the workspace sandbox. Private reads, network egress, external side effects, admin changes, and destructive actions always require an exact approval. Once any untrusted origin has influenced the thread, any later high-impact action also requires approval. Once workspace or private data has influenced it, brokered search/fetch and all other egress require approval of the exact outgoing action.
 - **Full access:** an admin or intentional single-user deployment may explicitly opt into direct execution with that user's normal OS permissions. This is never the default, and route, agent-loop, and dispatcher gates reject it for non-admin users.
 
-An approval is an opaque, expiring, one-use server record bound to the owner, session, origin run, exact tool name and input, workspace, security mode, effect classification, and external-context state. The browser submits only the opaque approval ID and the user's approve/deny decision. On approval, the server executes its sealed copy before the next model turn; natural-language confirmation and a model-repeated or modified command carry no authority.
+Multiplexed tools such as `manage_memory`, `manage_documents`, and `manage_tasks` are classified from the sealed action discriminator. Known read actions get private-read authority, known writes get write authority, and malformed or unknown actions get the fail-high union.
+
+An approval is an opaque, expiring, one-use server record bound to the owner, session, origin run, exact tool name and input, workspace, security mode, effect classification, and complete provenance snapshot. The browser submits only the opaque approval ID and the user's approve/deny decision. On approval, the server executes its sealed copy before the next model turn; natural-language confirmation and a model-repeated or modified command carry no authority.
 
 ## Security Headers
 

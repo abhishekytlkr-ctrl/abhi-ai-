@@ -9,6 +9,7 @@ from src.chat_helpers import extract_urls
 from src.youtube_handler import is_youtube_url
 from src.search import comprehensive_web_search, fetch_webpage_content
 from src.prompt_security import UNTRUSTED_CONTEXT_POLICY, untrusted_context_message
+from src.provenance import ContextSensitivity, ProvenanceOrigin
 
 logger = logging.getLogger(__name__)
 
@@ -325,6 +326,8 @@ class ChatProcessor:
                         "Pinned memory context. Some pinned memories are only "
                         f"included when relevant:\n- {pinned_text}"
                     ),
+                    origin=ProvenanceOrigin.ODYSSEUS,
+                    sensitivity=ContextSensitivity.PRIVATE,
                 ))
                 for m in selected_pinned:
                     self._last_used_memories.append({"text": m["text"], "category": m.get("category", "fact"), "type": "pinned"})
@@ -342,6 +345,8 @@ class ChatProcessor:
                             "Memory context. Do not reference unless the user asks "
                             f"about these topics.\n{ext_text}"
                         ),
+                        origin=ProvenanceOrigin.ODYSSEUS,
+                        sensitivity=ContextSensitivity.PRIVATE,
                     ))
                     for m in relevant:
                         self._last_used_memories.append({"text": m["text"], "category": m.get("category", "fact"), "type": "recalled"})
@@ -381,7 +386,12 @@ class ChatProcessor:
                         )
                         if len(rag_content) > 10000:
                             rag_content = rag_content[:10000] + "\n[Truncated]"
-                        preface.append(untrusted_context_message("retrieved documents", rag_content))
+                        preface.append(untrusted_context_message(
+                            "retrieved documents",
+                            rag_content,
+                            origin=ProvenanceOrigin.ODYSSEUS,
+                            sensitivity=ContextSensitivity.PRIVATE,
+                        ))
             except Exception as e:
                 logger.warning(f"RAG retrieval failed: {e}")
 
@@ -443,7 +453,12 @@ class ChatProcessor:
                     web_context, web_sources = comprehensive_web_search(
                         search_query, time_filter=time_filter, return_sources=True
                     )
-                    preface.append(untrusted_context_message("web search results", web_context))
+                    preface.append(untrusted_context_message(
+                        "web search results",
+                        web_context,
+                        origin=ProvenanceOrigin.EXTERNAL,
+                        sensitivity=ContextSensitivity.PUBLIC,
+                    ))
             except Exception as e:
                 logger.error(f"Web search failed: {e}")
                 preface.append({"role": "system", "content": "Web search encountered an error and could not retrieve results."})
@@ -465,6 +480,8 @@ class ChatProcessor:
                     preface.append(untrusted_context_message(
                         f"web page: {url}",
                         f"Content from {url}:\n\n{content}",
+                        origin=ProvenanceOrigin.EXTERNAL,
+                        sensitivity=ContextSensitivity.PUBLIC,
                     ))
 
         # Skills index — progressive disclosure. Only injected when the
@@ -488,6 +505,11 @@ class ChatProcessor:
                     for s in sorted(by_cat[cat], key=lambda x: x["name"]):
                         desc = s.get("description") or ""
                         lines.append(f"    - {s['name']}: {desc}" if desc else f"    - {s['name']}")
-                preface.append(untrusted_context_message("available skills index", "\n".join(lines)))
+                preface.append(untrusted_context_message(
+                    "available skills index",
+                    "\n".join(lines),
+                    origin=ProvenanceOrigin.ODYSSEUS,
+                    sensitivity=ContextSensitivity.PRIVATE,
+                ))
 
         return preface, rag_sources, web_sources

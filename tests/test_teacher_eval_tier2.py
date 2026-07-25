@@ -215,6 +215,12 @@ async def test_run_teacher_inline_triggers_tier2_escalation(monkeypatch):
         workspace="/tmp/workspace",
         security_mode="ask",
         external_untrusted_context_seen=True,
+        provenance_state={
+            "external_untrusted_context_seen": True,
+            "workspace_untrusted_context_seen": True,
+            "odysseus_untrusted_context_seen": False,
+            "private_data_context_seen": True,
+        },
     ):
         events.append(evt)
 
@@ -227,6 +233,12 @@ async def test_run_teacher_inline_triggers_tier2_escalation(monkeypatch):
     assert nested_kwargs[0]["workspace"] == "/tmp/workspace"
     assert nested_kwargs[0]["security_mode"] == "ask"
     assert nested_kwargs[0]["external_untrusted_context_seen"] is True
+    assert nested_kwargs[0]["provenance_state"] == {
+        "external_untrusted_context_seen": True,
+        "workspace_untrusted_context_seen": True,
+        "odysseus_untrusted_context_seen": False,
+        "private_data_context_seen": True,
+    }
 
 
 @pytest.mark.asyncio

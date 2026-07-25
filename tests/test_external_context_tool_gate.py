@@ -10,13 +10,11 @@ from src.tool_capabilities import (
     KNOWN_CAPABILITY_TOOLS,
     ToolEffect,
     ToolRunSecurityContext,
+    capabilities_for_action,
     capabilities_for_tool,
     messages_contain_external_untrusted_context,
 )
 from src.tool_approvals import ToolApprovalStore
-from src.tool_capabilities import capabilities_for_tool
-
-
 ToolBlock = namedtuple("ToolBlock", ["tool_type", "content"])
 
 
@@ -294,6 +292,50 @@ def test_fake_weak_model_search_then_bash_same_batch_requires_approval(monkeypat
     )
 
 
+def test_persisted_workspace_state_survives_a_later_model_turn(monkeypatch):
+    import core.database as database
+
+    executed = []
+    agent_loop = _patch_agent_loop(
+        monkeypatch,
+        ["```web_search\nquery derived from repository content\n```"],
+        executed,
+    )
+    monkeypatch.setattr(
+        database,
+        "get_session_agent_provenance",
+        lambda session_id: {
+            "external_untrusted_context_seen": False,
+            "workspace_untrusted_context_seen": True,
+            "odysseus_untrusted_context_seen": False,
+            "private_data_context_seen": False,
+        },
+    )
+    monkeypatch.setattr(
+        database,
+        "merge_session_agent_provenance",
+        lambda session_id, state: True,
+    )
+
+    events = _collect_agent_events(
+        agent_loop.stream_agent_loop(
+            "http://different-model.test/v1",
+            "another-small-model",
+            [{"role": "user", "content": "continue"}],
+            session_id="persisted-thread",
+            max_rounds=1,
+            relevant_tools={"web_search"},
+        )
+    )
+
+    assert executed == []
+    assert any(
+        event.get("type") == "ask_user"
+        and event.get("data", {}).get("action", {}).get("tool") == "web_search"
+        for event in events
+    )
+
+
 def test_ask_mode_never_starts_model_requested_bash_without_approval(monkeypatch):
     executed = []
     agent_loop = _patch_agent_loop(
@@ -354,6 +396,87 @@ def test_approval_boundary_stops_later_blocks_in_same_model_batch(monkeypatch):
     )
 
 
+def test_approved_private_read_then_exact_query_egress_needs_second_approval(
+    monkeypatch,
+):
+    import src.agent_loop as agent_loop
+
+    store = ToolApprovalStore()
+    content = "list"
+    pending = store.create(
+        owner="alice",
+        session_id="session-1",
+        origin_run_id="origin-run",
+        tool_name="manage_memory",
+        content=content,
+        workspace="/tmp/workspace",
+        security_mode="sandbox",
+        security_context=ToolRunSecurityContext(),
+        capabilities=capabilities_for_action("manage_memory", content),
+    )
+    grant = store.consume(
+        pending.approval_id,
+        decision="approve",
+        owner="alice",
+        session_id="session-1",
+    )
+    executed = []
+
+    monkeypatch.setattr(
+        agent_loop,
+        "get_setting",
+        lambda key, default=None: default,
+        raising=False,
+    )
+    monkeypatch.setattr(agent_loop, "get_mcp_manager", lambda: None)
+    monkeypatch.setattr(agent_loop, "estimate_tokens", lambda *args, **kwargs: 10)
+
+    async def fake_stream(*args, **kwargs):
+        yield "data: " + json.dumps(
+            {"delta": "```web_search\nquery derived from private memory\n```"}
+        ) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append((block.tool_type, block.content))
+        return "manage_memory", {
+            "results": "private account fact",
+            "exit_code": 0,
+        }
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute)
+
+    events = _collect_agent_events(
+        agent_loop.stream_agent_loop(
+            "http://local.test/v1",
+            "small-local-model",
+            [{"role": "user", "content": "Allow once"}],
+            session_id="session-1",
+            owner="alice",
+            workspace="/tmp/workspace",
+            relevant_tools={"manage_memory", "web_search"},
+            max_rounds=1,
+            security_mode="sandbox",
+            exact_approval=grant,
+        )
+    )
+
+    assert executed == [("manage_memory", "list")]
+    approvals = [
+        event["data"]
+        for event in events
+        if event.get("type") == "ask_user"
+        and event.get("data", {}).get("kind") == "tool_approval"
+    ]
+    assert approvals
+    assert approvals[0]["action"]["tool"] == "web_search"
+    assert approvals[0]["action"]["content"] == (
+        "query derived from private memory"
+    )
+    assert "private" in approvals[0]["description"].lower()
+
+
 def test_approved_resume_executes_sealed_action_before_next_model_turn(monkeypatch):
     import src.agent_loop as agent_loop
 
@@ -366,7 +489,9 @@ def test_approved_resume_executes_sealed_action_before_next_model_turn(monkeypat
         content="printf sealed",
         workspace="/tmp/workspace",
         security_mode="ask",
-        external_untrusted_context_seen=True,
+        security_context=ToolRunSecurityContext(
+            external_untrusted_context_seen=True
+        ),
         capabilities=capabilities_for_tool("bash"),
     )
     grant = store.consume(
@@ -442,7 +567,7 @@ def test_mismatched_approval_does_not_expose_or_execute_sealed_action(
         content="printf owner-secret-command",
         workspace="/tmp/workspace",
         security_mode="ask",
-        external_untrusted_context_seen=False,
+        security_context=ToolRunSecurityContext(),
         capabilities=capabilities_for_tool("bash"),
     )
     grant = store.consume(

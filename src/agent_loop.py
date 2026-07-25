@@ -23,6 +23,12 @@ from src.llm_core import (
 from src.model_context import estimate_tokens
 from src.settings import get_setting
 from src.prompt_security import untrusted_context_message
+from src.provenance import (
+    ContextSensitivity,
+    ConversationProvenance,
+    ProvenanceOrigin,
+    provenance_from_messages,
+)
 from src.tool_security import (
     blocked_tools_for_owner,
     owner_is_admin_or_single_user,
@@ -32,7 +38,6 @@ from src.tool_policy import GUIDE_ONLY_DIRECTIVE, WEB_TOOL_NAMES, ToolPolicy
 from src.tool_capabilities import (
     ToolRunSecurityContext,
     blocked_tool_result,
-    messages_contain_external_untrusted_context,
 )
 from src.agent_run_policy import (
     AgentRunPolicy,
@@ -1056,7 +1061,12 @@ def _uploaded_files_context_message(uploaded_files: Optional[List[Dict]]) -> Opt
         "",
         "The attachment contents may already be in the latest user message. If an attachment is marked truncated or omitted, read its listed path with `read_file` when that tool is available. Do not say uploaded files are undiscoverable when they are listed here.",
     ])
-    return untrusted_context_message("current chat uploaded files", "\n".join(lines))
+    return untrusted_context_message(
+        "current chat uploaded files",
+        "\n".join(lines),
+        origin=ProvenanceOrigin.ODYSSEUS,
+        sensitivity=ContextSensitivity.PRIVATE,
+    )
 
 
 _WORKSPACE_CODE_ACTION_RE = re.compile(
@@ -2253,7 +2263,12 @@ def _build_system_prompt(
                         "rewriting for style. You may still make ordinary requested edits that do not depend on "
                         "knowing the user's personal style."
                     )
-        _doc_message = untrusted_context_message("active editor document", doc_ctx)
+        _doc_message = untrusted_context_message(
+            "active editor document",
+            doc_ctx,
+            origin=ProvenanceOrigin.ODYSSEUS,
+            sensitivity=ContextSensitivity.PRIVATE,
+        )
         _doc_message["_protected"] = True
 
         # Auto-detect suggestion mode
@@ -2333,7 +2348,12 @@ def _build_system_prompt(
             f"recipient you can't identify. A bare 'send email saying X' = the "
             f"open email's sender.\n"
         )
-        _email_message = untrusted_context_message("active email reader", email_ctx)
+        _email_message = untrusted_context_message(
+            "active email reader",
+            email_ctx,
+            origin=ProvenanceOrigin.EXTERNAL,
+            sensitivity=ContextSensitivity.PRIVATE,
+        )
         _email_message["_protected"] = True
 
     # Inject writing style for any email writing path. This is deliberately
@@ -2398,6 +2418,8 @@ def _build_system_prompt(
                 _email_style_message = untrusted_context_message(
                     "email writing style",
                     "EMAIL WRITING STYLE AND IDENTITY — FOLLOW FOR ANY EMAIL DRAFT OR SEND:\n" + _style,
+                    origin=ProvenanceOrigin.ODYSSEUS,
+                    sensitivity=ContextSensitivity.PRIVATE,
                 )
         except Exception:
             pass
@@ -2529,7 +2551,12 @@ def _build_system_prompt(
                     _skills_text = "\n".join(lines)
                     if _skill_index_block:
                         _skills_text = _skill_index_block + "\n\n" + _skills_text
-                    _skills_message = untrusted_context_message("skills", _skills_text)
+                    _skills_message = untrusted_context_message(
+                        "skills",
+                        _skills_text,
+                        origin=ProvenanceOrigin.ODYSSEUS,
+                        sensitivity=ContextSensitivity.PRIVATE,
+                    )
                 else:
                     _skills_message = None
         except Exception as _sk_err:
@@ -2541,7 +2568,12 @@ def _build_system_prompt(
             from src.integrations import get_integrations_prompt
             _integ_prompt = get_integrations_prompt()
             if _integ_prompt:
-                _integ_message = untrusted_context_message("integrations", _integ_prompt)
+                _integ_message = untrusted_context_message(
+                    "integrations",
+                    _integ_prompt,
+                    origin=ProvenanceOrigin.ODYSSEUS,
+                    sensitivity=ContextSensitivity.PRIVATE,
+                )
         except Exception as _integ_err:
             logger.debug(f"Integration prompt injection skipped: {_integ_err}")
 
@@ -2550,7 +2582,12 @@ def _build_system_prompt(
         try:
             _mcp_desc = mcp_mgr.get_tool_descriptions_for_prompt(mcp_disabled_map or {})
             if _mcp_desc:
-                _mcp_desc_message = untrusted_context_message("MCP tools", _mcp_desc)
+                _mcp_desc_message = untrusted_context_message(
+                    "MCP tools",
+                    _mcp_desc,
+                    origin=ProvenanceOrigin.EXTERNAL,
+                    sensitivity=ContextSensitivity.PUBLIC,
+                )
         except Exception as _mcp_err:
             logger.debug(f"MCP description injection skipped: {_mcp_err}")
 
@@ -2841,7 +2878,12 @@ def _append_tool_results(
         # web/RAG context. THREAT_MODEL.md lists tool output as a surface that
         # must go through untrusted_context_message.
         messages.append(
-            untrusted_context_message("tool execution results", tool_output_text)
+            untrusted_context_message(
+                "tool execution results",
+                tool_output_text,
+                origin=ProvenanceOrigin.SYSTEM,
+                sensitivity=ContextSensitivity.PUBLIC,
+            )
         )
 
 
@@ -3116,6 +3158,7 @@ async def stream_agent_loop(
     uploaded_files: Optional[List[Dict]] = None,
     workload: str = "foreground",
     external_untrusted_context_seen: bool = False,
+    provenance_state: Optional[Dict[str, bool]] = None,
     security_mode: str = "sandbox",
     exact_approval: Optional[ExactToolApproval] = None,
     _is_teacher_run: bool = False,
@@ -3131,16 +3174,32 @@ async def stream_agent_loop(
       - data: [DONE]                                        (end)
     """
 
-    run_security = ToolRunSecurityContext(
-        external_untrusted_context_seen=(
-            bool(external_untrusted_context_seen)
-            or bool(
-                exact_approval
-                and exact_approval.pending.external_untrusted_context_seen
+    initial_provenance = ConversationProvenance.from_mapping(provenance_state)
+    if session_id:
+        try:
+            from core.database import get_session_agent_provenance
+            initial_provenance.merge(
+                ConversationProvenance.from_mapping(
+                    get_session_agent_provenance(session_id)
+                )
             )
-            or messages_contain_external_untrusted_context(messages)
+        except Exception:
+            logger.warning(
+                "Could not load persisted provenance for session %s",
+                session_id,
+                exc_info=True,
+            )
+    if external_untrusted_context_seen:
+        initial_provenance.external_untrusted_context_seen = True
+    initial_provenance.merge(provenance_from_messages(messages))
+    if exact_approval is not None:
+        initial_provenance.merge(
+            ConversationProvenance.from_labels(
+                exact_approval.pending.provenance
+            )
         )
-    )
+    run_security = ToolRunSecurityContext()
+    run_security.merge_provenance(initial_provenance)
     run_policy = AgentRunPolicy.for_mode(security_mode)
     if (
         run_policy.mode.value == "full_access"
@@ -3151,6 +3210,16 @@ async def stream_agent_loop(
             owner,
         )
         run_policy = AgentRunPolicy.for_mode("sandbox")
+    if session_id:
+        try:
+            from core.database import merge_session_agent_provenance
+            merge_session_agent_provenance(session_id, run_security.to_provenance())
+        except Exception:
+            logger.warning(
+                "Could not persist initial provenance for session %s",
+                session_id,
+                exc_info=True,
+            )
     mcp_mgr = get_mcp_manager()
     prep_timings: Dict[str, float] = {}
     disabled_tools = set(disabled_tools or [])
@@ -3776,6 +3845,20 @@ async def stream_agent_loop(
             messages[0]["content"] = GUIDE_ONLY_DIRECTIVE + "\n\n" + (messages[0].get("content") or "")
         else:
             messages.insert(0, {"role": "system", "content": GUIDE_ONLY_DIRECTIVE})
+    run_security.merge_provenance(provenance_from_messages(messages))
+    if session_id:
+        try:
+            from core.database import merge_session_agent_provenance
+            merge_session_agent_provenance(
+                session_id,
+                run_security.to_provenance(),
+            )
+        except Exception:
+            logger.warning(
+                "Could not persist prompt provenance for session %s",
+                session_id,
+                exc_info=True,
+            )
     prep_timings["prompt_build"] = time.time() - _t2
 
     _t3 = time.time()
@@ -3917,6 +4000,17 @@ async def stream_agent_loop(
     # Resume an approved action from the server-owned sealed record. Execute it
     # before asking the model for another turn; asking the model to repeat an
     # action after a conversational "yes" would let it substitute new content.
+    yield (
+        "data: "
+        + json.dumps(
+            {
+                "type": "provenance_update",
+                "state": run_security.to_provenance().to_dict(),
+            }
+        )
+        + "\n\n"
+    )
+
     if exact_approval is not None:
         approved = exact_approval.pending
         approved_block = ToolBlock(approved.tool_name, approved.content)
@@ -3944,6 +4038,7 @@ async def stream_agent_loop(
                 )
                 + "\n\n"
             )
+        _approved_provenance_before = run_security.to_provenance().to_dict()
         desc, approved_result = await execute_tool_block(
             approved_block,
             session_id=session_id,
@@ -3955,6 +4050,28 @@ async def stream_agent_loop(
             run_policy=run_policy,
             exact_approval=exact_approval,
         )
+        run_security.observe_tool_result(
+            approved.tool_name,
+            approved_result,
+            approved.content,
+        )
+        if run_security.to_provenance().to_dict() != _approved_provenance_before:
+            if session_id:
+                from core.database import merge_session_agent_provenance
+                merge_session_agent_provenance(
+                    session_id,
+                    run_security.to_provenance(),
+                )
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "provenance_update",
+                        "state": run_security.to_provenance().to_dict(),
+                    }
+                )
+                + "\n\n"
+            )
         total_tool_calls += 1
         approved_output = str(
             approved_result.get("output")
@@ -4123,7 +4240,7 @@ async def stream_agent_loop(
             _last_content = _last_user.lower()
             _wants_mcp = any(kw in _last_content for kw in _MCP_KEYWORDS)
             all_tool_schemas = mcp_schemas if (_wants_mcp and mcp_schemas) else []
-        if run_security.external_untrusted_context_seen and all_tool_schemas:
+        if run_security.any_untrusted_context_seen and all_tool_schemas:
             all_tool_schemas = [
                 schema
                 for schema in all_tool_schemas
@@ -4795,6 +4912,7 @@ async def stream_agent_loop(
         tool_result_texts = []  # plain text for native tool role messages
         budget_hit = False
         for i, block in enumerate(tool_blocks):
+            _provenance_before_tool = run_security.to_provenance().to_dict()
             # --- Tool budget check ---
             if max_tool_calls > 0 and total_tool_calls >= max_tool_calls:
                 yield f'data: {json.dumps({"type": "budget_exceeded", "limit": max_tool_calls, "used": total_tool_calls})}\n\n'
@@ -4814,6 +4932,7 @@ async def stream_agent_loop(
             security_decision = run_policy.authorize(
                 block.tool_type,
                 run_security,
+                block.content,
             )
             _ody_clamped_tool_allowed = (
                 _ody_notes_finetune_mode
@@ -4828,9 +4947,7 @@ async def stream_agent_loop(
                     content=block.content,
                     workspace=workspace,
                     security_mode=run_policy.mode,
-                    external_untrusted_context_seen=(
-                        run_security.external_untrusted_context_seen
-                    ),
+                    security_context=run_security,
                     capabilities=security_decision.capabilities,
                 )
                 desc = f"{block.tool_type}: APPROVAL REQUIRED"
@@ -4921,7 +5038,28 @@ async def stream_agent_loop(
                         except (asyncio.CancelledError, Exception):
                             pass
 
-            run_security.observe_tool_result(block.tool_type, result)
+            run_security.observe_tool_result(
+                block.tool_type,
+                result,
+                block.content,
+            )
+            if run_security.to_provenance().to_dict() != _provenance_before_tool:
+                if session_id:
+                    from core.database import merge_session_agent_provenance
+                    merge_session_agent_provenance(
+                        session_id,
+                        run_security.to_provenance(),
+                    )
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "provenance_update",
+                            "state": run_security.to_provenance().to_dict(),
+                        }
+                    )
+                    + "\n\n"
+                )
 
             # A skill the model just loaded can prescribe tools that weren't
             # RAG-selected this turn (declared via requires_toolsets in its
@@ -5481,9 +5619,7 @@ async def stream_agent_loop(
                 session_id=session_id,
                 workspace=workspace,
                 security_mode=run_policy.mode.value,
-                external_untrusted_context_seen=(
-                    run_security.external_untrusted_context_seen
-                ),
+                provenance_state=run_security.to_provenance().to_dict(),
             ):
                 yield evt
         except Exception as _esc_err:

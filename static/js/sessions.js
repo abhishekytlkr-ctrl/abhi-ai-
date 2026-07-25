@@ -1857,6 +1857,9 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
     if (meta && typeof window.__odysseusSetSecurityMode === 'function') {
       window.__odysseusSetSecurityMode(meta.security_mode || 'sandbox');
     }
+    if (typeof window.__odysseusSetProvenance === 'function') {
+      window.__odysseusSetProvenance(meta?.agent_provenance || {});
+    }
 
     // Detach any in-flight stream to background instead of aborting
     try {
