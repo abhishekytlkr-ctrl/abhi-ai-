@@ -23,13 +23,22 @@ from src.llm_core import (
 from src.model_context import estimate_tokens
 from src.settings import get_setting
 from src.prompt_security import untrusted_context_message
-from src.tool_security import blocked_tools_for_owner, plan_mode_disabled_tools
+from src.tool_security import (
+    blocked_tools_for_owner,
+    owner_is_admin_or_single_user,
+    plan_mode_disabled_tools,
+)
 from src.tool_policy import GUIDE_ONLY_DIRECTIVE, WEB_TOOL_NAMES, ToolPolicy
 from src.tool_capabilities import (
     ToolRunSecurityContext,
     blocked_tool_result,
     messages_contain_external_untrusted_context,
 )
+from src.agent_run_policy import (
+    AgentRunPolicy,
+    AuthorizationOutcome,
+)
+from src.tool_approvals import ExactToolApproval, tool_approval_store
 from src.tool_utils import _truncate, get_mcp_manager
 from src.agent_tools import (
     parse_tool_blocks,
@@ -3107,6 +3116,8 @@ async def stream_agent_loop(
     uploaded_files: Optional[List[Dict]] = None,
     workload: str = "foreground",
     external_untrusted_context_seen: bool = False,
+    security_mode: str = "sandbox",
+    exact_approval: Optional[ExactToolApproval] = None,
     _is_teacher_run: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
@@ -3123,9 +3134,23 @@ async def stream_agent_loop(
     run_security = ToolRunSecurityContext(
         external_untrusted_context_seen=(
             bool(external_untrusted_context_seen)
+            or bool(
+                exact_approval
+                and exact_approval.pending.external_untrusted_context_seen
+            )
             or messages_contain_external_untrusted_context(messages)
         )
     )
+    run_policy = AgentRunPolicy.for_mode(security_mode)
+    if (
+        run_policy.mode.value == "full_access"
+        and not owner_is_admin_or_single_user(owner)
+    ):
+        logger.warning(
+            "Full-access agent mode rejected by loop backstop for owner=%r",
+            owner,
+        )
+        run_policy = AgentRunPolicy.for_mode("sandbox")
     mcp_mgr = get_mcp_manager()
     prep_timings: Dict[str, float] = {}
     disabled_tools = set(disabled_tools or [])
@@ -3889,6 +3914,150 @@ async def stream_agent_loop(
     # so the user can resume instead of the turn silently stalling.
     _exhausted_rounds = False
 
+    # Resume an approved action from the server-owned sealed record. Execute it
+    # before asking the model for another turn; asking the model to repeat an
+    # action after a conversational "yes" would let it substitute new content.
+    if exact_approval is not None:
+        approved = exact_approval.pending
+        approved_block = ToolBlock(approved.tool_name, approved.content)
+        approved_display = approved.content.strip()
+        approval_matches = exact_approval.matches(
+            owner=owner,
+            session_id=session_id,
+            tool_name=approved.tool_name,
+            content=approved.content,
+            workspace=workspace,
+            security_mode=run_policy.mode,
+        )
+        if approval_matches:
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "tool_start",
+                        "tool": approved.tool_name,
+                        "command": approved_display[:240],
+                        "full_command": approved_display,
+                        "round": 0,
+                        "approved": True,
+                    }
+                )
+                + "\n\n"
+            )
+        desc, approved_result = await execute_tool_block(
+            approved_block,
+            session_id=session_id,
+            disabled_tools=disabled_tools,
+            tool_policy=tool_policy,
+            owner=owner,
+            workspace=workspace,
+            security_context=run_security,
+            run_policy=run_policy,
+            exact_approval=exact_approval,
+        )
+        total_tool_calls += 1
+        approved_output = str(
+            approved_result.get("output")
+            or approved_result.get("stdout")
+            or approved_result.get("response")
+            or approved_result.get("results")
+            or approved_result.get("content")
+            or approved_result.get("error")
+            or "(no output)"
+        )
+        approved_event = {
+            "type": "tool_output",
+            "tool": approved.tool_name,
+            "command": approved_display[:240] if approval_matches else "",
+            "output": _truncate(approved_output),
+            "exit_code": approved_result.get("exit_code"),
+            "approved": True,
+        }
+        for key in (
+            "image_url",
+            "image_id",
+            "image_prompt",
+            "image_model",
+            "image_size",
+            "image_quality",
+            "doc_id",
+            "title",
+            "language",
+            "content",
+            "version",
+            "action",
+            "ui_event",
+        ):
+            if key in approved_result:
+                approved_event[key] = approved_result[key]
+        yield "data: " + json.dumps(approved_event) + "\n\n"
+        if approved_result.get("ui_event"):
+            yield (
+                "data: "
+                + json.dumps({"type": "ui_control", "data": approved_result})
+                + "\n\n"
+            )
+        if approved_result.get("doc_id") and approved_result.get("content") is not None:
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "doc_update",
+                        "doc_id": approved_result["doc_id"],
+                        "title": approved_result.get("title", ""),
+                        "language": approved_result.get("language", ""),
+                        "content": approved_result.get("content", ""),
+                        "version": approved_result.get("version", 1),
+                    }
+                )
+                + "\n\n"
+            )
+        if approved_result.get("image_url"):
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "generated_image",
+                        "url": approved_result["image_url"],
+                        **{
+                            key: approved_result[key]
+                            for key in (
+                                "image_url",
+                                "image_id",
+                                "image_prompt",
+                                "image_model",
+                                "image_size",
+                                "image_quality",
+                            )
+                            if key in approved_result
+                        },
+                    }
+                )
+                + "\n\n"
+            )
+        tool_events.append(
+            {
+                "round": 0,
+                "tool": approved.tool_name,
+                "desc": desc,
+                "command": approved_display[:240] if approval_matches else "",
+                "output": _truncate(approved_output),
+                "exit_code": approved_result.get("exit_code"),
+                "approved": True,
+                "approval_digest": approved.digest[:16],
+            }
+        )
+        formatted_approved_result = format_tool_result(desc, approved_result)
+        _append_tool_results(
+            messages,
+            "",
+            [],
+            [formatted_approved_result],
+            [formatted_approved_result],
+            False,
+            0,
+        )
+
     for round_num in range(1, max_rounds + 1):
         round_response = ""
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
@@ -3958,9 +4127,10 @@ async def stream_agent_loop(
             all_tool_schemas = [
                 schema
                 for schema in all_tool_schemas
-                if run_security.decision_for(
-                    (schema.get("function") or {}).get("name") or schema.get("name")
-                ).allowed
+                if run_policy.authorize(
+                    (schema.get("function") or {}).get("name") or schema.get("name"),
+                    run_security,
+                ).outcome is not AuthorizationOutcome.DENY
             ]
         agent_stream_timeout = int(get_setting("agent_stream_timeout_seconds", 300) or 300)
 
@@ -4641,12 +4811,42 @@ async def stream_agent_loop(
             else:
                 cmd_display = full_command
 
-            security_decision = run_security.decision_for(block.tool_type)
+            security_decision = run_policy.authorize(
+                block.tool_type,
+                run_security,
+            )
             _ody_clamped_tool_allowed = (
                 _ody_notes_finetune_mode
                 and block.tool_type in {"manage_notes", "manage_calendar", "manage_tasks"}
             )
-            if not security_decision.allowed:
+            if security_decision.outcome is AuthorizationOutcome.REQUIRE_APPROVAL:
+                pending_approval = tool_approval_store.create(
+                    owner=owner,
+                    session_id=session_id,
+                    origin_run_id=run_security.run_id,
+                    tool_name=block.tool_type,
+                    content=block.content,
+                    workspace=workspace,
+                    security_mode=run_policy.mode,
+                    external_untrusted_context_seen=(
+                        run_security.external_untrusted_context_seen
+                    ),
+                    capabilities=security_decision.capabilities,
+                )
+                desc = f"{block.tool_type}: APPROVAL REQUIRED"
+                result = {
+                    "output": "Waiting for an exact user approval.",
+                    "exit_code": None,
+                    "approval_required": True,
+                    "ask_user": pending_approval.public_payload(
+                        reason=security_decision.reason,
+                    ),
+                }
+                logger.info(
+                    "Exact approval required before tool start: %s",
+                    block.tool_type,
+                )
+            elif security_decision.outcome is AuthorizationOutcome.DENY:
                 desc, result = blocked_tool_result(
                     block.tool_type,
                     security_decision.reason or "Tool blocked by external-context policy.",
@@ -4688,6 +4888,7 @@ async def stream_agent_loop(
                             progress_cb=_push_progress,
                             workspace=workspace,
                             security_context=run_security,
+                            run_policy=run_policy,
                         )
                     finally:
                         # Sentinel so the drainer knows to stop.
@@ -5113,6 +5314,10 @@ async def stream_agent_loop(
                 and not result.get("error")
             ):
                 _ody_doc_tool_completed = True
+            if _pending_ask_user_event:
+                # The approval card is a turn boundary. Do not execute any
+                # later model-supplied block from the same batch.
+                break
 
         # If budget was hit, stop the loop
         if budget_hit:
@@ -5273,6 +5478,12 @@ async def stream_agent_loop(
                 student_tool_events=tool_events,
                 student_reply=full_response,
                 owner=owner,
+                session_id=session_id,
+                workspace=workspace,
+                security_mode=run_policy.mode.value,
+                external_untrusted_context_seen=(
+                    run_security.external_untrusted_context_seen
+                ),
             ):
                 yield evt
         except Exception as _esc_err:

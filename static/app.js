@@ -10,14 +10,14 @@ import modelsModule from './js/models.js?v=20260715startupcalm2';
 import ragModule from './js/rag.js';
 import presetsModule from './js/presets.js';
 import searchModule from './js/search.js';
-import chatModule from './js/chat.js?v=20260722ctxheader4';
+import chatModule from './js/chat.js?v=20260725agentsecurity1';
 import compareModule from './js/compare/index.js?v=20260723compareicon2';
 import documentModule from './js/document.js?v=20260722emailfastindex1';
 import searchChatModule from './js/search-chat.js';
 import { makeWindowDraggable } from './js/windowDrag.js';
 import markdownModule from './js/markdown.js';
-import chatRenderer from './js/chatRenderer.js?v=20260722emailfastindex1';
-import sessionModule from './js/sessions.js?v=20260722ctxheader4';
+import chatRenderer from './js/chatRenderer.js?v=20260725agentsecurity1';
+import sessionModule from './js/sessions.js?v=20260725agentsecurity1';
 import memoryModule from './js/memory.js?v=20260722memoryloading1';
 import voiceRecorderModule from './js/voiceRecorder.js';
 import censorModule from './js/censor.js';
@@ -841,6 +841,9 @@ function initializeEventListeners() {
     // Close document panel if open
     if (documentModule && documentModule.closePanel) documentModule.closePanel();
     if (researchPanelModule && researchPanelModule.isOpen()) researchPanelModule.closePanel();
+    if (typeof window.__odysseusSetSecurityMode === 'function') {
+      window.__odysseusSetSecurityMode('sandbox');
+    }
     // Reset research overflow dot (but don't touch research state — caller manages that)
     const _overflowRes = el('overflow-research-btn');
     if (_overflowRes) _overflowRes.classList.remove('active');
@@ -1834,6 +1837,53 @@ function initializeEventListeners() {
     chatBtn.addEventListener('click', () => setMode('chat'));
 	    setMode(currentMode);
 	  })();
+
+  // ── Thread-level agent authority mode ──
+  (function initAgentSecurityMode() {
+    const select = el('agent-security-mode');
+    if (!select) return;
+    const allowed = new Set(['ask', 'sandbox', 'full_access']);
+
+    function setSecurityMode(mode) {
+      let next = allowed.has(mode) ? mode : 'sandbox';
+      if (!select.querySelector(`option[value="${next}"]`)) next = 'sandbox';
+      const state = loadToggleState();
+      state.security_mode = next;
+      saveToggleState(state);
+      select.value = next;
+      select.title = next === 'full_access'
+        ? 'Full access: commands run with your normal OS permissions.'
+        : next === 'ask'
+          ? 'Ask: confirm each risky exact action.'
+          : 'Sandbox: workspace-only process isolation; trust-boundary actions ask.';
+      return true;
+    }
+
+    select.addEventListener('change', async () => {
+      const state = loadToggleState();
+      const previous = allowed.has(state.security_mode)
+        ? state.security_mode
+        : 'sandbox';
+      const selected = select.value;
+      if (selected === 'full_access') {
+        select.value = previous;
+        const confirmed = await uiModule.styledConfirm(
+          'Full access lets model-requested commands run directly with your normal OS permissions.',
+          {
+            confirmText: 'Enable full access',
+            cancelText: 'Keep current mode',
+            danger: true,
+          },
+        );
+        if (!confirmed) return;
+      }
+      setSecurityMode(selected);
+    });
+    window.__odysseusSetSecurityMode = (mode) => {
+      setSecurityMode(mode);
+    };
+    setSecurityMode(loadToggleState().security_mode || 'sandbox');
+  })();
 
   (function initPlanToggle() {
     const btn = el('plan-toggle-btn');

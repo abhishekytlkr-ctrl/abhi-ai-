@@ -562,6 +562,10 @@ async def run_teacher_inline(
     student_tool_events: List[Dict[str, Any]],
     student_reply: str,
     owner: Optional[str] = None,
+    session_id: Optional[str] = None,
+    workspace: Optional[str] = None,
+    security_mode: str = "sandbox",
+    external_untrusted_context_seen: bool = False,
 ):
     """Async generator. Yields SSE event strings.
 
@@ -667,6 +671,10 @@ async def run_teacher_inline(
         messages=teacher_messages,
         headers=teacher_headers,
         owner=owner,
+        session_id=session_id,
+        workspace=workspace,
+        security_mode=security_mode,
+        external_untrusted_context_seen=external_untrusted_context_seen,
         _is_teacher_run=True,
     ):
         # Swallow teacher's own [DONE] — outer loop emits the real one

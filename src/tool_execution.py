@@ -28,6 +28,12 @@ from src.tool_security import (
     owner_is_admin_or_single_user,
 )
 from src.tool_capabilities import ToolRunSecurityContext, blocked_tool_result
+from src.agent_run_policy import (
+    AgentRunPolicy,
+    AuthorizationOutcome,
+    ExecutionProfile,
+)
+from src.tool_approvals import ExactToolApproval
 from src.tool_policy import ToolPolicy
 from src.constants import (
     AGENT_WORKSPACE_DIR,
@@ -454,11 +460,17 @@ async def _call_mcp_tool(
     tool: str,
     content: str,
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
+    execution_profile: ExecutionProfile = ExecutionProfile.WORKSPACE_SANDBOX,
 ) -> Dict:
     """Route a legacy tool call through the MCP manager, with direct fallbacks."""
     mcp = get_mcp_manager()
     if not mcp:
-        return await _direct_fallback(tool, content, progress_cb=progress_cb) or {"error": f"MCP manager not available for tool '{tool}'", "exit_code": 1}
+        return await _direct_fallback(
+            tool,
+            content,
+            progress_cb=progress_cb,
+            execution_profile=execution_profile,
+        ) or {"error": f"MCP manager not available for tool '{tool}'", "exit_code": 1}
 
     server_id, tool_name = _MCP_TOOL_MAP[tool]
     qualified = f"mcp__{server_id}__{tool_name}"
@@ -467,7 +479,12 @@ async def _call_mcp_tool(
 
     # If MCP server not connected, try direct fallback
     if isinstance(result, dict) and result.get("exit_code") == 1 and "not connected" in result.get("error", ""):
-        fallback = await _direct_fallback(tool, content, progress_cb=progress_cb)
+        fallback = await _direct_fallback(
+            tool,
+            content,
+            progress_cb=progress_cb,
+            execution_profile=execution_profile,
+        )
         if fallback:
             return fallback
 
@@ -527,12 +544,14 @@ async def _direct_fallback(
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
     session_id: Optional[str] = None,
     owner: Optional[str] = None,
+    execution_profile: ExecutionProfile = ExecutionProfile.WORKSPACE_SANDBOX,
 ) -> Optional[Dict]:
     try:
         ctx = {
             "progress_cb": progress_cb,
             "session_id": session_id,
             "owner": owner,
+            "execution_profile": execution_profile.value,
         }
 
         from src.agent_tools import TOOL_HANDLERS
@@ -572,6 +591,8 @@ async def execute_tool_block(
     workspace: Optional[str] = None,
     tool_policy: Optional[Any] = None,
     security_context: Optional[ToolRunSecurityContext] = None,
+    run_policy: Optional[AgentRunPolicy] = None,
+    exact_approval: Optional[ExactToolApproval] = None,
 ) -> Tuple[str, Dict]:
     """Execute a single tool block. Returns (description, result_dict).
 
@@ -579,7 +600,64 @@ async def execute_tool_block(
     cwd confine to it) for the duration of this call, then delegate. Reset on the
     way out so the binding never leaks to the next tool call.
     """
-    if security_context is not None:
+    execution_profile = ExecutionProfile.WORKSPACE_SANDBOX
+    approval_claimed = False
+    if exact_approval is not None and run_policy is not None:
+        approval_claimed = exact_approval.claim(
+            owner=owner,
+            session_id=session_id,
+            tool_name=getattr(block, "tool_type", None),
+            content=getattr(block, "content", None),
+            workspace=workspace,
+            security_mode=run_policy.mode,
+        )
+        if not approval_claimed:
+            return (
+                f"{getattr(block, 'tool_type', None)}: BLOCKED",
+                {
+                    "error": "The exact-action approval did not match this tool request.",
+                    "exit_code": 1,
+                    "blocked": True,
+                    "policy": "exact_tool_approval",
+                },
+            )
+
+    if run_policy is not None and security_context is not None and not approval_claimed:
+        if (
+            run_policy.execution_profile is ExecutionProfile.HOST_FULL_ACCESS
+            and not owner_is_admin_or_single_user(owner)
+        ):
+            return (
+                f"{getattr(block, 'tool_type', None)}: BLOCKED",
+                {
+                    "error": "Host full-access execution requires an admin user.",
+                    "exit_code": 1,
+                    "blocked": True,
+                    "policy": "agent_run_policy",
+                },
+            )
+        authorization = run_policy.authorize(
+            getattr(block, "tool_type", None),
+            security_context,
+        )
+        if authorization.outcome is AuthorizationOutcome.REQUIRE_APPROVAL:
+            return (
+                f"{getattr(block, 'tool_type', None)}: APPROVAL REQUIRED",
+                {
+                    "error": authorization.reason or "Exact user approval required.",
+                    "exit_code": 1,
+                    "blocked": True,
+                    "approval_required": True,
+                    "policy": "agent_run_policy",
+                },
+            )
+        if authorization.outcome is AuthorizationOutcome.DENY:
+            return blocked_tool_result(
+                getattr(block, "tool_type", None),
+                authorization.reason or "Tool denied by run policy.",
+            )
+        execution_profile = run_policy.execution_profile
+    elif security_context is not None and not approval_claimed:
         decision = security_context.decision_for(getattr(block, "tool_type", None))
         if not decision.allowed:
             logger.warning(
@@ -600,6 +678,7 @@ async def execute_tool_block(
             owner=owner,
             progress_cb=progress_cb,
             tool_policy=tool_policy,
+            execution_profile=execution_profile,
         )
         if security_context is not None:
             security_context.observe_tool_result(
@@ -618,6 +697,7 @@ async def _execute_tool_block_impl(
     owner: Optional[str] = None,
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
     tool_policy: Optional[Any] = None,
+    execution_profile: ExecutionProfile = ExecutionProfile.WORKSPACE_SANDBOX,
 ) -> Tuple[str, Dict]:
     """Execute a single tool block. Returns (description, result_dict).
 
@@ -739,6 +819,7 @@ async def _execute_tool_block_impl(
                     _bg_cmd,
                     session_id=session_id,
                     cwd=agent_cwd(),
+                    execution_profile=execution_profile.value,
                 )
             except Exception as exc:
                 return (
@@ -773,22 +854,44 @@ async def _execute_tool_block_impl(
     if tool in _MCP_TOOL_MAP:
         first_line = content.split(chr(10))[0][:80]
         desc = f"{tool}: {first_line}"
-        result = await _call_mcp_tool(tool, content, progress_cb=progress_cb)
+        result = await _call_mcp_tool(
+            tool,
+            content,
+            progress_cb=progress_cb,
+            execution_profile=execution_profile,
+        )
     elif tool in ("grep", "glob", "ls", "get_workspace"):
         # Code-navigation tools — no MCP server; run the direct implementation.
         first_line = content.split(chr(10))[0][:80]
         desc = f"{tool}: {first_line}"
-        result = await _direct_fallback(tool, content, progress_cb=progress_cb) \
+        result = await _direct_fallback(
+            tool,
+            content,
+            progress_cb=progress_cb,
+            execution_profile=execution_profile,
+        ) \
             or {"error": f"{tool}: execution failed", "exit_code": 1}
     elif tool in ("apply_patch", "todowrite"):
         first_line = content.split(chr(10))[0][:80]
         desc = f"{tool}: {first_line}" if first_line else tool
-        result = await _direct_fallback(tool, content, session_id=session_id, owner=owner) \
+        result = await _direct_fallback(
+            tool,
+            content,
+            session_id=session_id,
+            owner=owner,
+            execution_profile=execution_profile,
+        ) \
             or {"error": f"{tool}: execution failed", "exit_code": 1}
     elif tool == "manage_bg_jobs":
         # Inspect/kill detached `bash` jobs; needs session_id to scope to chat.
         desc = f"manage_bg_jobs: {content.split(chr(10))[0][:80]}"
-        result = await _direct_fallback(tool, content, session_id=session_id, owner=owner) \
+        result = await _direct_fallback(
+            tool,
+            content,
+            session_id=session_id,
+            owner=owner,
+            execution_profile=execution_profile,
+        ) \
             or {"error": "manage_bg_jobs: execution failed", "exit_code": 1}
     elif tool in ("create_document", "update_document", "edit_document",
                   "suggest_document", "manage_documents"):
@@ -977,7 +1080,12 @@ async def _execute_tool_block_impl(
     elif tool in dynamic_handlers:
         first_line = content.split(chr(10))[0][:80]
         desc = f"registry: {tool} {first_line}".strip()
-        res = await _direct_fallback(tool, content, progress_cb=progress_cb)
+        res = await _direct_fallback(
+            tool,
+            content,
+            progress_cb=progress_cb,
+            execution_profile=execution_profile,
+        )
 
         if isinstance(res, tuple):
             desc, result = res

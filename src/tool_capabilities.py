@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
+import uuid
 
 from src.tool_security import BUILTIN_EMAIL_TOOLS
 
@@ -302,6 +303,7 @@ def messages_contain_external_untrusted_context(messages: Iterable[dict]) -> boo
 class ToolRunSecurityContext:
     """Server-owned integrity state for one agent run."""
 
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     external_untrusted_context_seen: bool = False
     external_sources: list[str] = field(default_factory=list)
 

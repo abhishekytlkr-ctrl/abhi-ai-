@@ -3,6 +3,7 @@ import hashlib
 import os
 import re
 import shutil
+import sys
 import time
 import collections
 from typing import Optional, Callable, Awaitable, Tuple, Dict
@@ -12,6 +13,7 @@ from src.execution_sandbox import (
     sandbox_command,
     sandbox_python_executable,
 )
+from src.agent_run_policy import ExecutionProfile
 
 DEFAULT_BASH_TIMEOUT = 60 * 60     # 1 hour
 DEFAULT_PYTHON_TIMEOUT = 60 * 60
@@ -21,12 +23,21 @@ PROGRESS_TAIL_LINES = 12
 TMUX_CAPTURE_LINES = 2000
 
 
-def _tmux_session_name(session_id: Optional[str], workspace: str = "") -> str:
+def _tmux_session_name(
+    session_id: Optional[str],
+    workspace: str = "",
+    execution_profile: str = ExecutionProfile.WORKSPACE_SANDBOX.value,
+) -> str:
     raw = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(session_id or "default")).strip("-")
     workspace_key = hashlib.sha256(
         os.path.realpath(workspace or ".").encode("utf-8", errors="replace")
     ).hexdigest()[:10]
-    return f"ody-agent-sbx-v1-{raw[:60] or 'default'}-{workspace_key}"
+    profile_tag = (
+        "host"
+        if execution_profile == ExecutionProfile.HOST_FULL_ACCESS.value
+        else "sbx"
+    )
+    return f"ody-agent-{profile_tag}-v1-{raw[:60] or 'default'}-{workspace_key}"
 
 
 async def _run_exec(*args: str, timeout: float = 10) -> Tuple[str, str, int]:
@@ -121,12 +132,16 @@ async def _run_tmux_bash(
     cwd: str,
     timeout: float,
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
+    execution_profile: str = ExecutionProfile.WORKSPACE_SANDBOX.value,
 ) -> Tuple[str, str, Optional[int], bool]:
-    name = _tmux_session_name(session_id, cwd)
-    shell_argv = sandbox_command(
-        ["/bin/bash", "--noprofile", "--norc"],
-        workspace=cwd,
-    )
+    name = _tmux_session_name(session_id, cwd, execution_profile)
+    if execution_profile == ExecutionProfile.HOST_FULL_ACCESS.value:
+        shell_argv = ["/bin/bash", "--noprofile", "--norc"]
+    else:
+        shell_argv = sandbox_command(
+            ["/bin/bash", "--noprofile", "--norc"],
+            workspace=cwd,
+        )
     await _ensure_tmux_session(name, cwd, shell_argv)
 
     stamp = f"{int(time.time() * 1000)}-{abs(hash(content)) % 1000000}"
@@ -288,6 +303,10 @@ class BashTool:
             content = str(content.get("command") or content.get("cmd") or content.get("code") or "")
         progress_cb = ctx.get("progress_cb")
         session_id = ctx.get("session_id")
+        execution_profile = str(
+            ctx.get("execution_profile")
+            or ExecutionProfile.WORKSPACE_SANDBOX.value
+        )
         workspace = agent_cwd()
         if session_id and shutil.which("tmux"):
             stdout, stderr, rc, timed_out = await _run_tmux_bash(
@@ -296,6 +315,7 @@ class BashTool:
                 cwd=workspace,
                 timeout=DEFAULT_BASH_TIMEOUT,
                 progress_cb=progress_cb,
+                execution_profile=execution_profile,
             )
             if timed_out:
                 return {
@@ -303,7 +323,9 @@ class BashTool:
                     "exit_code": 124,
                     "stdout": _truncate(stdout, MAX_OUTPUT_CHARS),
                     "stderr": _truncate(stderr, MAX_OUTPUT_CHARS),
-                    "tmux_session": _tmux_session_name(str(session_id), workspace),
+                    "tmux_session": _tmux_session_name(
+                        str(session_id), workspace, execution_profile
+                    ),
                 }
             output = stdout.rstrip()
             err = stderr.rstrip()
@@ -312,18 +334,25 @@ class BashTool:
             return {
                 "output": _truncate(output, MAX_OUTPUT_CHARS) or "(no output)",
                 "exit_code": rc or 0,
-                "tmux_session": _tmux_session_name(str(session_id), workspace),
+                "tmux_session": _tmux_session_name(
+                    str(session_id), workspace, execution_profile
+                ),
             }
 
-        argv = sandbox_command(
-            ["/bin/bash", "--noprofile", "--norc", "-c", content],
-            workspace=workspace,
-        )
+        if execution_profile == ExecutionProfile.HOST_FULL_ACCESS.value:
+            argv = ["/bin/bash", "--noprofile", "--norc", "-c", content]
+            process_env = None
+        else:
+            argv = sandbox_command(
+                ["/bin/bash", "--noprofile", "--norc", "-c", content],
+                workspace=workspace,
+            )
+            process_env = environment_for_sandbox_launcher()
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=environment_for_sandbox_launcher(),
+            env=process_env,
             cwd=workspace,
         )
         stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
@@ -344,16 +373,25 @@ class PythonTool:
     async def execute(self, content: str, ctx: dict) -> dict:
         from src.tool_execution import agent_cwd, _truncate
         progress_cb = ctx.get("progress_cb")
-        workspace = agent_cwd()
-        argv = sandbox_command(
-            [sandbox_python_executable(), "-I", "-c", content],
-            workspace=workspace,
+        execution_profile = str(
+            ctx.get("execution_profile")
+            or ExecutionProfile.WORKSPACE_SANDBOX.value
         )
+        workspace = agent_cwd()
+        if execution_profile == ExecutionProfile.HOST_FULL_ACCESS.value:
+            argv = [sys.executable, "-I", "-c", content]
+            process_env = None
+        else:
+            argv = sandbox_command(
+                [sandbox_python_executable(), "-I", "-c", content],
+                workspace=workspace,
+            )
+            process_env = environment_for_sandbox_launcher()
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=environment_for_sandbox_launcher(),
+            env=process_env,
             cwd=workspace,
         )
         stdout, stderr, rc, timed_out = await _run_subprocess_streaming(

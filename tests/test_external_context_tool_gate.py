@@ -13,6 +13,8 @@ from src.tool_capabilities import (
     capabilities_for_tool,
     messages_contain_external_untrusted_context,
 )
+from src.tool_approvals import ToolApprovalStore
+from src.tool_capabilities import capabilities_for_tool
 
 
 ToolBlock = namedtuple("ToolBlock", ["tool_type", "content"])
@@ -214,7 +216,7 @@ async def test_dispatcher_updates_context_from_external_result(monkeypatch):
     assert result["blocked"] is True
 
 
-def test_fake_weak_model_search_then_bash_next_round_is_blocked(monkeypatch):
+def test_fake_weak_model_search_then_bash_next_round_requires_approval(monkeypatch):
     executed = []
     agent_loop = _patch_agent_loop(
         monkeypatch,
@@ -239,7 +241,12 @@ def test_fake_weak_model_search_then_bash_next_round_is_blocked(monkeypatch):
     assert any(
         event.get("type") == "tool_output"
         and event.get("tool") == "bash"
-        and event.get("exit_code") == 1
+        and event.get("ask_user", {}).get("kind") == "tool_approval"
+        for event in events
+    )
+    assert any(
+        event.get("type") == "ask_user"
+        and event.get("data", {}).get("kind") == "tool_approval"
         for event in events
     )
     assert not any(
@@ -248,7 +255,7 @@ def test_fake_weak_model_search_then_bash_next_round_is_blocked(monkeypatch):
     )
 
 
-def test_fake_weak_model_search_then_bash_same_batch_is_blocked(monkeypatch):
+def test_fake_weak_model_search_then_bash_same_batch_requires_approval(monkeypatch):
     executed = []
     agent_loop = _patch_agent_loop(
         monkeypatch,
@@ -273,9 +280,209 @@ def test_fake_weak_model_search_then_bash_same_batch_is_blocked(monkeypatch):
     )
 
     assert executed == ["web_search"]
-    blocked = [
+    pending = [
         event
         for event in events
         if event.get("type") == "tool_output" and event.get("tool") == "bash"
     ]
-    assert blocked and blocked[0]["exit_code"] == 1
+    assert pending
+    assert pending[0]["exit_code"] is None
+    assert pending[0]["ask_user"]["kind"] == "tool_approval"
+    assert not any(
+        event.get("type") == "tool_start" and event.get("tool") == "bash"
+        for event in events
+    )
+
+
+def test_ask_mode_never_starts_model_requested_bash_without_approval(monkeypatch):
+    executed = []
+    agent_loop = _patch_agent_loop(
+        monkeypatch,
+        ["```bash\nprintf requested\n```"],
+        executed,
+    )
+
+    events = _collect_agent_events(
+        agent_loop.stream_agent_loop(
+            "http://local.test/v1",
+            "small-local-model",
+            [{"role": "user", "content": "run it"}],
+            max_rounds=1,
+            relevant_tools={"bash"},
+            security_mode="ask",
+        )
+    )
+
+    assert executed == []
+    assert any(
+        event.get("type") == "ask_user"
+        and event.get("data", {}).get("kind") == "tool_approval"
+        for event in events
+    )
+    assert not any(event.get("type") == "tool_start" for event in events)
+
+
+def test_approval_boundary_stops_later_blocks_in_same_model_batch(monkeypatch):
+    executed = []
+    agent_loop = _patch_agent_loop(
+        monkeypatch,
+        [
+            (
+                "```bash\nprintf requested\n```\n"
+                "```read_file\nshould-not-run.txt\n```"
+            )
+        ],
+        executed,
+    )
+
+    events = _collect_agent_events(
+        agent_loop.stream_agent_loop(
+            "http://local.test/v1",
+            "small-local-model",
+            [{"role": "user", "content": "run and read"}],
+            max_rounds=1,
+            relevant_tools={"bash", "read_file"},
+            security_mode="ask",
+        )
+    )
+
+    assert executed == []
+    assert not any(
+        event.get("type") == "tool_start"
+        and event.get("tool") == "read_file"
+        for event in events
+    )
+
+
+def test_approved_resume_executes_sealed_action_before_next_model_turn(monkeypatch):
+    import src.agent_loop as agent_loop
+
+    store = ToolApprovalStore()
+    pending = store.create(
+        owner="alice",
+        session_id="session-1",
+        origin_run_id="origin-run",
+        tool_name="bash",
+        content="printf sealed",
+        workspace="/tmp/workspace",
+        security_mode="ask",
+        external_untrusted_context_seen=True,
+        capabilities=capabilities_for_tool("bash"),
+    )
+    grant = store.consume(
+        pending.approval_id,
+        decision="approve",
+        owner="alice",
+        session_id="session-1",
+    )
+    executed = []
+
+    monkeypatch.setattr(
+        agent_loop,
+        "get_setting",
+        lambda key, default=None: default,
+        raising=False,
+    )
+    monkeypatch.setattr(agent_loop, "get_mcp_manager", lambda: None)
+    monkeypatch.setattr(agent_loop, "estimate_tokens", lambda *args, **kwargs: 10)
+
+    async def fake_stream(*args, **kwargs):
+        yield "data: " + json.dumps(
+            {"delta": "```bash\nprintf substituted\n```"}
+        ) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append((block.tool_type, block.content))
+        return "bash", {"output": "sealed output", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute)
+
+    events = _collect_agent_events(
+        agent_loop.stream_agent_loop(
+            "http://local.test/v1",
+            "small-local-model",
+            [{"role": "user", "content": "Allow once"}],
+            session_id="session-1",
+            owner="alice",
+            workspace="/tmp/workspace",
+            relevant_tools={"bash"},
+            max_rounds=1,
+            security_mode="ask",
+            exact_approval=grant,
+        )
+    )
+
+    assert executed == [("bash", "printf sealed")]
+    starts = [
+        event for event in events if event.get("type") == "tool_start"
+    ]
+    assert starts[0]["full_command"] == "printf sealed"
+    assert starts[0]["approved"] is True
+    assert any(
+        event.get("type") == "ask_user"
+        and event.get("data", {}).get("action", {}).get("content")
+        == "printf substituted"
+        for event in events
+    )
+
+
+def test_mismatched_approval_does_not_expose_or_execute_sealed_action(
+    monkeypatch,
+):
+    import src.agent_loop as agent_loop
+
+    store = ToolApprovalStore()
+    pending = store.create(
+        owner="alice",
+        session_id="session-1",
+        origin_run_id="origin-run",
+        tool_name="bash",
+        content="printf owner-secret-command",
+        workspace="/tmp/workspace",
+        security_mode="ask",
+        external_untrusted_context_seen=False,
+        capabilities=capabilities_for_tool("bash"),
+    )
+    grant = store.consume(
+        pending.approval_id,
+        decision="approve",
+        owner="alice",
+        session_id="session-1",
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "get_setting",
+        lambda key, default=None: default,
+        raising=False,
+    )
+    monkeypatch.setattr(agent_loop, "get_mcp_manager", lambda: None)
+    monkeypatch.setattr(agent_loop, "estimate_tokens", lambda *args, **kwargs: 10)
+
+    async def fake_stream(*args, **kwargs):
+        yield f"data: {json.dumps({'delta': 'Denied safely.'})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream)
+    events = _collect_agent_events(
+        agent_loop.stream_agent_loop(
+            "http://local.test/v1",
+            "small-local-model",
+            [{"role": "user", "content": "Allow once"}],
+            session_id="session-1",
+            owner="mallory",
+            workspace="/tmp/workspace",
+            max_rounds=1,
+            security_mode="ask",
+            exact_approval=grant,
+        )
+    )
+
+    assert not any(event.get("type") == "tool_start" for event in events)
+    outputs = [
+        event for event in events if event.get("type") == "tool_output"
+    ]
+    assert outputs and outputs[0]["exit_code"] == 1
+    assert outputs[0]["command"] == ""
+    assert "owner-secret-command" not in json.dumps(events)
