@@ -15,9 +15,10 @@ import logging
 import os
 import pathlib
 import re
+import shlex
 import sys
 import time
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 
 
@@ -501,6 +502,34 @@ def _promote_image_fields(result: Dict) -> None:
 
 
 _BG_MARKERS = {"#!bg", "#bg", "# bg", "#background", "# background", "@background", "# @background"}
+_WORKSPACE_SHELL_MUTATION_CMD_FALLBACK_RE = re.compile(
+    r"(^|[;&|]\s*)(cp|copy|copy-item|mv|move|rename|ren|touch|tee)\b|"
+    r"(^|[;&|]\s*)(sed\s+-i|perl\s+-pi|awk\s+-i)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_WORKSPACE_SHELL_MUTATION_COMMANDS = {
+    "cp",
+    "copy",
+    "copy-item",
+    "mv",
+    "move",
+    "rename",
+    "ren",
+    "touch",
+    "tee",
+}
+_WORKSPACE_SHELL_IN_PLACE_COMMANDS = {"awk", "perl", "sed"}
+_WORKSPACE_SHELL_COMMAND_POSITION_WORDS = {"then", "do", "else", "elif"}
+_WORKSPACE_SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+_WORKSPACE_SHELL_PUNCTUATION = set("(){};<>|&")
+_WORKSPACE_SHELL_HEREDOC_TOKENS = {"<<", "<<-"}
+_WORKSPACE_SHELL_OUTPUT_REDIRECT_TOKENS = {">", ">>", ">|", "&>", "&>>", ">&", ">>&"}
+_WORKSPACE_SHELL_OUTPUT_REDIRECT_RE = re.compile(
+    r"^(?P<fd>\d*)?(?P<op>&>>|>>&|>>|>\||&>|>&|>)(?P<target>.*)$"
+)
+_WORKSPACE_SHELL_FD_TARGET_RE = re.compile(r"^&?\d+$|^&?-$")
+_WORKSPACE_SHELL_DEV_FD_RE = re.compile(r"^/(?:dev/fd|proc/self/fd)/\d+$")
+_WORKSPACE_SHELL_SINK_TARGETS = {"/dev/null", "/dev/stdout", "/dev/stderr", os.devnull.lower()}
 
 
 def _split_bg_marker(content: str):
@@ -514,6 +543,182 @@ def _split_bg_marker(content: str):
         del lines[i]
         return True, "\n".join(lines).strip()
     return False, content
+
+
+def _workspace_shell_tokens(command: str) -> Optional[List[str]]:
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _workspace_shell_is_punctuation_token(token: str) -> bool:
+    return bool(token) and all(char in _WORKSPACE_SHELL_PUNCTUATION for char in token)
+
+
+def _workspace_shell_starts_command_position(token: str) -> bool:
+    if not _workspace_shell_is_punctuation_token(token):
+        return token.lower() in _WORKSPACE_SHELL_COMMAND_POSITION_WORDS
+    if ">" in token or "<" in token:
+        return False
+    return any(char in token for char in ";&|({")
+
+
+def _workspace_shell_command_name(token: str) -> str:
+    command = token.strip("`").replace("\\", "/").rstrip("/")
+    return command.rsplit("/", 1)[-1].lower()
+
+
+def _workspace_shell_perl_in_place_option(option: str) -> bool:
+    if not option.startswith("-") or option == "--":
+        return False
+    flags = option[1:]
+    return (
+        option.startswith("-i")
+        or option.startswith("-pi")
+        or ("p" in flags and "i" in flags)
+    )
+
+
+def _workspace_shell_in_place_option(command: str, option: str) -> bool:
+    option = option.lower()
+    if command == "perl":
+        return _workspace_shell_perl_in_place_option(option)
+    if command in {"awk", "sed"}:
+        return (
+            option == "--in-place"
+            or option.startswith("--in-place=")
+            or option.startswith("-i")
+        )
+    return False
+
+
+def _workspace_shell_command_is_mutating(tokens: List[str], index: int) -> bool:
+    command = _workspace_shell_command_name(tokens[index])
+    if command in _WORKSPACE_SHELL_MUTATION_COMMANDS:
+        return True
+    if command not in _WORKSPACE_SHELL_IN_PLACE_COMMANDS:
+        return False
+
+    for token in tokens[index + 1 :]:
+        if _workspace_shell_starts_command_position(token):
+            break
+        if token == "--":
+            break
+        if _workspace_shell_in_place_option(command, token):
+            return True
+    return False
+
+
+def _workspace_shell_has_mutation_command(command: str) -> bool:
+    tokens = _workspace_shell_tokens(command)
+    if tokens is None:
+        return bool(_WORKSPACE_SHELL_MUTATION_CMD_FALLBACK_RE.search(command))
+
+    expect_command = True
+    for index, token in enumerate(tokens):
+        if _workspace_shell_starts_command_position(token):
+            expect_command = True
+            continue
+        if not expect_command:
+            continue
+        if _WORKSPACE_SHELL_ASSIGNMENT_RE.match(token):
+            continue
+        if _workspace_shell_command_is_mutating(tokens, index):
+            return True
+        expect_command = False
+    return False
+
+
+def _workspace_shell_redirect_target_is_safe(target: str, workspace: str) -> bool:
+    target = (target or "").strip()
+    if not target:
+        return False
+    if _WORKSPACE_SHELL_FD_TARGET_RE.match(target):
+        return True
+
+    lowered = target.lower()
+    if lowered in _WORKSPACE_SHELL_SINK_TARGETS:
+        return True
+    if _WORKSPACE_SHELL_DEV_FD_RE.match(target):
+        return True
+
+    expanded = os.path.expandvars(os.path.expanduser(target))
+    if not os.path.isabs(expanded):
+        return False
+
+    try:
+        workspace_real = os.path.realpath(workspace)
+        target_real = os.path.realpath(expanded)
+        return os.path.commonpath([workspace_real, target_real]) != workspace_real
+    except (OSError, ValueError):
+        return False
+
+
+def _workspace_shell_redirects_to_workspace(command: str, workspace: str) -> bool:
+    tokens = _workspace_shell_tokens(command)
+    if tokens is None:
+        # If tokenization cannot determine quoting, keep the old safety posture
+        # for literal redirects while avoiding quoted/comparison false positives
+        # in valid shell.
+        return bool(re.search(r"(^|[\s;&|])(?:\d*)>{1,2}\S*", command) or "<<" in command)
+
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in _WORKSPACE_SHELL_HEREDOC_TOKENS or token.startswith("<<"):
+            return True
+
+        if token.isdigit() and i + 1 < len(tokens):
+            next_token = tokens[i + 1]
+            if next_token in _WORKSPACE_SHELL_OUTPUT_REDIRECT_TOKENS:
+                target = tokens[i + 2] if i + 2 < len(tokens) else ""
+                if not _workspace_shell_redirect_target_is_safe(target, workspace):
+                    return True
+                i += 3
+                continue
+
+        if token in _WORKSPACE_SHELL_OUTPUT_REDIRECT_TOKENS:
+            target = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if not _workspace_shell_redirect_target_is_safe(target, workspace):
+                return True
+            i += 2
+            continue
+
+        match = _WORKSPACE_SHELL_OUTPUT_REDIRECT_RE.match(token)
+        if match:
+            target = match.group("target")
+            if match.group("op") == ">&" and not target:
+                target = tokens[i + 1] if i + 1 < len(tokens) else ""
+                i += 1
+            if not _workspace_shell_redirect_target_is_safe(target, workspace):
+                return True
+        i += 1
+
+    return False
+
+
+def _workspace_shell_write_block_reason(tool: str, content: str) -> Optional[str]:
+    workspace = get_active_workspace()
+    if tool != "bash" or not workspace:
+        return None
+    _, command = _split_bg_marker(content or "")
+    if not command.strip():
+        return None
+    if not (
+        _workspace_shell_has_mutation_command(command)
+        or _workspace_shell_redirects_to_workspace(command, workspace)
+    ):
+        return None
+    return (
+        "Workspace file changes must use `write_file` for creates/full rewrites "
+        "or `edit_file` for targeted edits. Shell is still available for read-only "
+        "diagnostics, but redirection/heredocs/tee/cp/mv/touch/in-place edits are "
+        "blocked while a workspace is active."
+    )
 
 
 async def _direct_fallback(
@@ -711,6 +916,12 @@ async def _execute_tool_block_impl(
         logger.warning("Public tool policy blocked owner=%r tool=%s", owner, tool)
         return desc, result
 
+    workspace_shell_block = _workspace_shell_write_block_reason(tool, content)
+    if workspace_shell_block:
+        desc = f"{tool}: BLOCKED"
+        result = {"error": workspace_shell_block, "exit_code": 1}
+        logger.info("Workspace shell write blocked for tool=%s", tool)
+        return desc, result
 
     # Background execution: a `bash` block whose first line is the `#!bg`
     # marker runs DETACHED — returns a job id immediately so the chat stream
