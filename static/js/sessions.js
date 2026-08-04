@@ -3,7 +3,7 @@
 
 import Storage from './storage.js';
 import uiModule, { autoResize, styledPrompt } from './ui.js';
-import chatRenderer from './chatRenderer.js?v=20260722ctxheader1';
+import chatRenderer from './chatRenderer.js?v=20260725agentsecurity1';
 import { providerLogo } from './providers.js';
 import { initModelPicker, updateModelPicker } from './modelPicker.js?v=20260722ctxheader1';
 import themeModule from './theme.js';
@@ -1854,6 +1854,12 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
       if (presetsModule && presetsModule.onSessionSwitch) presetsModule.onSessionSwitch(id);
     } catch (e) {}
     const meta = sessions.find(s => s.id === id);
+    if (meta && typeof window.__odysseusSetSecurityMode === 'function') {
+      window.__odysseusSetSecurityMode(meta.security_mode || 'sandbox');
+    }
+    if (typeof window.__odysseusSetProvenance === 'function') {
+      window.__odysseusSetProvenance(meta?.agent_provenance || {});
+    }
 
     // Detach any in-flight stream to background instead of aborting
     try {

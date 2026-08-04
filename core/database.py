@@ -220,6 +220,11 @@ class Session(TimestampMixin, Base):
     total_input_tokens = Column(Integer, default=0)
     total_output_tokens = Column(Integer, default=0)
     mode = Column(String, nullable=True)  # 'agent', 'chat', or 'research'
+    security_mode = Column(String, nullable=False, default="sandbox")
+    agent_external_untrusted_seen = Column(Boolean, nullable=False, default=False)
+    agent_workspace_untrusted_seen = Column(Boolean, nullable=False, default=False)
+    agent_odysseus_untrusted_seen = Column(Boolean, nullable=False, default=False)
+    agent_private_data_seen = Column(Boolean, nullable=False, default=False)
     crew_member_id = Column(String, nullable=True)  # links to crew_members.id
 
     # Relationship to chat messages
@@ -249,6 +254,14 @@ class Session(TimestampMixin, Base):
             'total_input_tokens': self.total_input_tokens or 0,
             'total_output_tokens': self.total_output_tokens or 0,
             'crew_member_id': self.crew_member_id,
+            'mode': self.mode,
+            'security_mode': self.security_mode or 'sandbox',
+            'agent_provenance': {
+                'external_untrusted_context_seen': bool(self.agent_external_untrusted_seen),
+                'workspace_untrusted_context_seen': bool(self.agent_workspace_untrusted_seen),
+                'odysseus_untrusted_context_seen': bool(self.agent_odysseus_untrusted_seen),
+                'private_data_context_seen': bool(self.agent_private_data_seen),
+            },
         }
 
 class ChatMessage(Base):
@@ -1172,6 +1185,77 @@ def _migrate_add_mode_column():
         except Exception:
             pass
 
+def _migrate_add_security_mode_column():
+    """Add the fail-safe agent run mode to existing session databases."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(sessions)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "security_mode" not in columns:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN security_mode TEXT "
+                "NOT NULL DEFAULT 'sandbox'"
+            )
+            conn.commit()
+            logging.getLogger(__name__).info(
+                "Migrated: added 'security_mode' column to sessions"
+            )
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"Migration check for security_mode failed: {e}"
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def _migrate_add_agent_provenance_columns():
+    """Add monotonic per-thread provenance state to existing databases."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    columns_to_add = (
+        "agent_external_untrusted_seen",
+        "agent_workspace_untrusted_seen",
+        "agent_odysseus_untrusted_seen",
+        "agent_private_data_seen",
+    )
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        changed = False
+        for column in columns_to_add:
+            if column not in columns:
+                conn.execute(
+                    f"ALTER TABLE sessions ADD COLUMN {column} BOOLEAN "
+                    "NOT NULL DEFAULT 0"
+                )
+                changed = True
+        if changed:
+            conn.commit()
+            logging.getLogger(__name__).info(
+                "Migrated: added agent provenance columns to sessions"
+            )
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"Migration check for agent provenance failed: {e}"
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 def _migrate_add_folder_column():
     """Add folder column to sessions table if it doesn't exist."""
     import sqlite3
@@ -1942,6 +2026,8 @@ def init_db():
     _migrate_add_folder_column()
     _migrate_add_token_columns()
     _migrate_add_mode_column()
+    _migrate_add_security_mode_column()
+    _migrate_add_agent_provenance_columns()
     _migrate_add_multiuser_owner_columns()
     _migrate_add_gallery_caption_column()
     _migrate_add_api_token_scopes_column()
@@ -2513,6 +2599,99 @@ def set_session_mode(session_id: str, mode: str) -> bool:
         return True
     except Exception:
         logger.warning("Failed to persist mode %r for session %s", mode, session_id)
+        return False
+
+def get_session_security_mode(session_id: str) -> str:
+    """Return the persisted agent authority mode, defaulting safely."""
+    try:
+        with get_db_session() as db:
+            value = db.query(Session.security_mode).filter(
+                Session.id == session_id
+            ).scalar()
+            return value if value in {"ask", "sandbox", "full_access"} else "sandbox"
+    except Exception:
+        logger.warning("Failed to read security mode for session %s", session_id)
+        return "sandbox"
+
+def set_session_security_mode(session_id: str, mode: str) -> bool:
+    """Persist a validated agent authority mode; invalid values fail closed."""
+    if mode not in {"ask", "sandbox", "full_access"}:
+        return False
+    try:
+        with get_db_session() as db:
+            db.query(Session).filter(Session.id == session_id).update(
+                {"security_mode": mode}
+            )
+        return True
+    except Exception:
+        logger.warning(
+            "Failed to persist security mode %r for session %s",
+            mode,
+            session_id,
+        )
+        return False
+
+def get_session_agent_provenance(session_id: str) -> dict:
+    """Return server-owned monotonic provenance state for one thread."""
+    empty = {
+        "external_untrusted_context_seen": False,
+        "workspace_untrusted_context_seen": False,
+        "odysseus_untrusted_context_seen": False,
+        "private_data_context_seen": False,
+    }
+    try:
+        with get_db_session() as db:
+            row = db.query(
+                Session.agent_external_untrusted_seen,
+                Session.agent_workspace_untrusted_seen,
+                Session.agent_odysseus_untrusted_seen,
+                Session.agent_private_data_seen,
+            ).filter(Session.id == session_id).first()
+            if row is None:
+                return empty
+            return {
+                "external_untrusted_context_seen": bool(row[0]),
+                "workspace_untrusted_context_seen": bool(row[1]),
+                "odysseus_untrusted_context_seen": bool(row[2]),
+                "private_data_context_seen": bool(row[3]),
+            }
+    except Exception:
+        logger.warning("Failed to read agent provenance for session %s", session_id)
+        return empty
+
+def merge_session_agent_provenance(session_id: str, state) -> bool:
+    """Persist only newly observed provenance bits; never clear thread state."""
+    if not session_id:
+        return False
+    try:
+        from src.provenance import ConversationProvenance
+        provenance = (
+            state
+            if isinstance(state, ConversationProvenance)
+            else ConversationProvenance.from_mapping(state)
+        )
+        values = {}
+        if provenance.external_untrusted_context_seen:
+            values["agent_external_untrusted_seen"] = True
+        if provenance.workspace_untrusted_context_seen:
+            values["agent_workspace_untrusted_seen"] = True
+        if provenance.odysseus_untrusted_context_seen:
+            values["agent_odysseus_untrusted_seen"] = True
+        if provenance.private_data_context_seen:
+            values["agent_private_data_seen"] = True
+        if not values:
+            return True
+        with get_db_session() as db:
+            updated = db.query(Session).filter(Session.id == session_id).update(
+                values,
+                synchronize_session=False,
+            )
+        return bool(updated)
+    except Exception:
+        logger.warning(
+            "Failed to persist agent provenance for session %s",
+            session_id,
+        )
         return False
 
 def get_session_by_id(session_id: str):

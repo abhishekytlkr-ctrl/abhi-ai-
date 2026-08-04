@@ -8,7 +8,7 @@
 import Storage from './storage.js';
 import uiModule from './ui.js';
 import sessionModule from './sessions.js';
-import chatRenderer from './chatRenderer.js?v=20260722emailfastindex1';
+import chatRenderer from './chatRenderer.js?v=20260725agentsecurity1';
 import chatStream from './chatStream.js';
 import { addAITTSButton } from './tts-ai.js';
 import markdownModule from './markdown.js';
@@ -46,6 +46,27 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
   let _contextHeaderSeq = 0;
   let _contextHeaderData = null;
   let _contextHeaderBound = false;
+  let _pendingToolApproval = null;
+
+  document.addEventListener('odysseus:tool-approval', (event) => {
+    const detail = event && event.detail ? event.detail : {};
+    if (
+      !detail.approval_id
+      || !['approve', 'deny'].includes(String(detail.decision || '').toLowerCase())
+    ) return;
+    _pendingToolApproval = {
+      approval_id: String(detail.approval_id),
+      decision: String(detail.decision).toLowerCase(),
+    };
+    const input = document.getElementById('message');
+    if (input) {
+      input.value = detail.label || (
+        _pendingToolApproval.decision === 'approve' ? 'Allow once' : 'Deny'
+      );
+    }
+    const sendButton = document.querySelector('.send-btn');
+    if (sendButton) sendButton.click();
+  });
 
   function _fmtContextNumber(n) {
     const v = Number(n || 0);
@@ -1663,6 +1684,15 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
       // on; explicit web/current-info requests are handled by the backend
 	      // intent gate.
 	      const toggleState = Storage.loadToggleState();
+	      const securityMode = ['ask', 'sandbox', 'full_access'].includes(toggleState.security_mode)
+	        ? toggleState.security_mode
+	        : 'sandbox';
+	      if (sessionModule && typeof sessionModule.getSessions === 'function') {
+	        const currentMeta = sessionModule.getSessions().find(
+	          (item) => String(item.id) === String(streamSessionId)
+	        );
+	        if (currentMeta) currentMeta.security_mode = securityMode;
+	      }
 	      const isPlanMode = !!toggleState.plan_mode && !(el('research-toggle') && el('research-toggle').checked);
 	      let isAgentMode = (toggleState.mode || 'chat') === 'agent';
       const isIncognito = isIncognitoForSend;
@@ -1679,6 +1709,12 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
 	        isAgentMode = true;
 	      }
 	      fd.append('mode', isAgentMode ? 'agent' : 'chat');
+	      fd.append('security_mode', securityMode);
+	      if (_pendingToolApproval) {
+	        fd.append('tool_approval_id', _pendingToolApproval.approval_id);
+	        fd.append('tool_approval_decision', _pendingToolApproval.decision);
+	        _pendingToolApproval = null;
+	      }
 	      fd.append('plan_mode', isPlanMode ? 'true' : 'false');
 	      if (!isPlanMode && _pendingApprovedPlan) {
 	        fd.append('approved_plan', _pendingApprovedPlan.slice(0, 8192));
@@ -2324,6 +2360,19 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
               if (json.type === 'generated_image') {
                 _rememberGeneratedImage(json);
                 if (!_isBg) _appendGeneratedImageBubble(json);
+                continue;
+              }
+              if (json.type === 'provenance_update') {
+                const provenance = json.state && typeof json.state === 'object'
+                  ? json.state
+                  : {};
+                if (!_isBg) window.__odysseusSetProvenance?.(provenance);
+                if (sessionModule && typeof sessionModule.getSessions === 'function') {
+                  const currentMeta = sessionModule.getSessions().find(
+                    (item) => String(item.id) === String(streamSessionId)
+                  );
+                  if (currentMeta) currentMeta.agent_provenance = provenance;
+                }
                 continue;
               }
               if (json.type === 'agent_prep') {

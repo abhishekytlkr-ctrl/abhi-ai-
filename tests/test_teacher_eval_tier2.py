@@ -185,7 +185,10 @@ async def test_run_teacher_inline_triggers_tier2_escalation(monkeypatch):
     monkeypatch.setattr("src.teacher_escalation.evaluate_turn_llm", fake_evaluate_turn_llm)
 
     # Mock stream_agent_loop recursively called by run_teacher_inline
+    nested_kwargs = []
+
     async def fake_stream_agent_loop(*args, **kwargs):
+        nested_kwargs.append(kwargs)
         yield "data: {\"type\": \"tool_output\", \"tool\": \"bash\"}\n\n"
         yield "data: {\"type\": \"text\", \"delta\": \"Teacher reply\"}\n\n"
         yield "data: [DONE]\n\n"
@@ -208,6 +211,16 @@ async def test_run_teacher_inline_triggers_tier2_escalation(monkeypatch):
         student_tool_events=[],
         student_reply="student reply",
         owner="alice",
+        session_id="session-1",
+        workspace="/tmp/workspace",
+        security_mode="ask",
+        external_untrusted_context_seen=True,
+        provenance_state={
+            "external_untrusted_context_seen": True,
+            "workspace_untrusted_context_seen": True,
+            "odysseus_untrusted_context_seen": False,
+            "private_data_context_seen": True,
+        },
     ):
         events.append(evt)
 
@@ -215,6 +228,17 @@ async def test_run_teacher_inline_triggers_tier2_escalation(monkeypatch):
     assert any("teacher_takeover" in evt for evt in events)
     assert any("tool_output" in evt for evt in events)
     assert any("skill_saved" in evt for evt in events)
+    assert nested_kwargs
+    assert nested_kwargs[0]["session_id"] == "session-1"
+    assert nested_kwargs[0]["workspace"] == "/tmp/workspace"
+    assert nested_kwargs[0]["security_mode"] == "ask"
+    assert nested_kwargs[0]["external_untrusted_context_seen"] is True
+    assert nested_kwargs[0]["provenance_state"] == {
+        "external_untrusted_context_seen": True,
+        "workspace_untrusted_context_seen": True,
+        "odysseus_untrusted_context_seen": False,
+        "private_data_context_seen": True,
+    }
 
 
 @pytest.mark.asyncio
