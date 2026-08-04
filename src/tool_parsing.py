@@ -192,6 +192,10 @@ _QWEN_BARE_MARKER_RE = re.compile(
     r"(?:^|[\t\r\n ])assistan(?:t)?(?=[\t\r\n ]|$)",
     re.IGNORECASE,
 )
+_QWEN_TOOL_CALL_RE = re.compile(
+    r"<\|tool_call_start\|>\[(\w+)\(([\s\S]*?)\)\](?:\s*<\|tool_call_end\|>)?",
+    re.IGNORECASE
+)
 
 
 # Pattern 5: DeepSeek DSML markup leaking into content. When deepseek
@@ -1110,6 +1114,101 @@ def _parse_gemma_tool_call(tool_name: str, body: str) -> Optional[ToolBlock]:
     return function_call_to_tool_block(tool_name, json.dumps(params))
 
 
+_BUILTIN_POSITIONAL_ARGS = {
+    "bash": ["command"],
+    "python": ["code"],
+    "web_search": ["query", "time_filter"],
+    "web_fetch": ["url", "full"],
+    "read_file": ["path", "offset", "limit"],
+    "write_file": ["path", "content"],
+    "edit_file": ["path", "old_string", "new_string", "replace_all"],
+    "grep": ["pattern", "path", "glob", "ignore_case", "max_results"],
+    "glob": ["pattern", "path"],
+    "ls": ["path"],
+    "create_document": ["title", "language", "content"],
+}
+
+_BUILTIN_PRIMARY_ARG = {
+    "bash": "command",
+    "python": "code",
+    "web_search": "query",
+    "web_fetch": "url",
+    "read_file": "path",
+    "write_file": "path",
+    "edit_file": "path",
+    "grep": "pattern",
+    "glob": "pattern",
+    "ls": "path",
+    "create_document": "title",
+}
+
+
+def _parse_qwen_tool_call(tool_name: str, args_str: str) -> Optional[ToolBlock]:
+    """Parse a Qwen-style call: <|tool_call_start|>[tool_name(args_str)]<|tool_call_end|>."""
+    tool_name = tool_name.strip().lower().replace("-", "_")
+    args_str = args_str.strip()
+    
+    params = {}
+    if args_str:
+        import ast
+        try:
+            tree = ast.parse(f"dummy({args_str})")
+            call_node = None
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    call_node = node
+                    break
+            if call_node:
+                # Map positional arguments if we know the tool's signature
+                pos_names = _BUILTIN_POSITIONAL_ARGS.get(tool_name)
+                if pos_names:
+                    for idx, arg_val in enumerate(call_node.args):
+                        if idx < len(pos_names):
+                            try:
+                                params[pos_names[idx]] = ast.literal_eval(arg_val)
+                            except Exception:
+                                pass
+                # Map keyword arguments
+                for kw in call_node.keywords:
+                    try:
+                        params[kw.arg] = ast.literal_eval(kw.value)
+                    except Exception:
+                        pass
+        except Exception:
+            params = {}
+            # Fallback 1: regex key-value extraction that handles spaces and quotes
+            for m in re.finditer(r"(\w+)\s*=\s*['\"]?(.*?)['\"]?(?=\s*,\s*\w+\s*=|\s*$)", args_str):
+                k = m.group(1)
+                v = m.group(2).strip()
+                if v == "True":
+                    v = True
+                elif v == "False":
+                    v = False
+                elif v == "None":
+                    v = None
+                else:
+                    try:
+                        if "." in v:
+                            v = float(v)
+                        else:
+                            v = int(v)
+                    except ValueError:
+                        pass
+                params[k] = v
+
+            # Fallback 2: single argument fallback if no key-value pairs matched
+            if not params:
+                primary_arg = _BUILTIN_PRIMARY_ARG.get(tool_name)
+                if primary_arg:
+                    val = args_str.strip()
+                    if len(val) >= 2 and ((val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")):
+                        val = val[1:-1]
+                    params[primary_arg] = val
+
+    from src.tool_schemas import function_call_to_tool_block
+    return function_call_to_tool_block(tool_name, json.dumps(params))
+
+
 def _parse_function_model_call(body: str) -> Optional[ToolBlock]:
     """Parse <function_model><function_call>tool</...><parameters>...</...>."""
     name_match = _FUNCTION_MODEL_NAME_RE.search(body or "")
@@ -1379,6 +1478,15 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
             if block:
                 blocks.append(block)
 
+    # Pattern 4b_qwen: Qwen-style <|tool_call_start|> blocks
+    if not blocks:
+        for m in _QWEN_TOOL_CALL_RE.finditer(text):
+            tool_name = m.group(1)
+            args_str = m.group(2)
+            block = _parse_qwen_tool_call(tool_name, args_str)
+            if block:
+                blocks.append(block)
+
     # Pattern 4c: <function_model> wrapper from local MLX/Exo models.
     if not blocks:
         for _ms, inner_start, inner_end, _me in _iter_delimited(
@@ -1441,6 +1549,7 @@ def strip_tool_blocks(text: str, skip_fenced: bool = False) -> str:
     cleaned = _XML_OPEN_TOOL_CALL_RE.sub('', cleaned)
     cleaned = _strip_delimited(cleaned, _TOOL_CODE_OPEN_RE, _TOOL_CODE_CLOSE_RE)
     cleaned = _GEMMA_TOOL_CALL_RE.sub('', cleaned)
+    cleaned = _QWEN_TOOL_CALL_RE.sub('', cleaned)
     cleaned = _strip_delimited(cleaned, _FUNCTION_MODEL_OPEN_RE, _FUNCTION_MODEL_CLOSE_RE)
     cleaned = _strip_raw_openai_tool_call_json(cleaned)
     cleaned = _QWEN_ROLE_MARKER_RE.sub('', cleaned)
