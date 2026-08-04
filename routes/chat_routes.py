@@ -27,7 +27,13 @@ from core.exceptions import SessionNotFoundError
 from src.auth_helpers import effective_user, get_current_user
 from routes.session_routes import _verify_session_owner
 from routes.document_helpers import _owner_session_filter
-from core.database import SessionLocal, get_session_mode, set_session_mode
+from core.database import (
+    SessionLocal,
+    get_session_mode,
+    get_session_security_mode,
+    set_session_mode,
+    set_session_security_mode,
+)
 from core.database import Session as DBSession, ChatMessage as DBChatMessage
 from core.database import Document as DBDocument, ModelEndpoint
 from core.log_safety import redact_url
@@ -49,6 +55,9 @@ from src.tool_policy import (
     is_web_search_explicitly_denied,
     web_search_enabled_for_turn,
 )
+from src.agent_run_policy import AgentRunMode, parse_agent_run_mode
+from src.tool_approvals import tool_approval_store
+from src.tool_security import owner_is_admin_or_single_user
 
 logger = logging.getLogger(__name__)
 
@@ -734,6 +743,19 @@ def setup_chat_routes(
         incognito = str(form_data.get("incognito", "")).lower() == "true"
         plan_mode = str(form_data.get("plan_mode") or (body or {}).get("plan_mode") or "").lower() == "true"
         chat_mode = str(form_data.get("mode", "")).lower()  # 'chat' or 'agent'
+        requested_security_mode = (
+            form_data.get("security_mode")
+            or (body or {}).get("security_mode")
+        )
+        tool_approval_id = (
+            form_data.get("tool_approval_id")
+            or (body or {}).get("tool_approval_id")
+        )
+        tool_approval_decision = (
+            form_data.get("tool_approval_decision")
+            or (body or {}).get("tool_approval_decision")
+        )
+        exact_tool_approval = None
         # Workspace: confine the agent's file/shell tools to this folder.
         workspace, workspace_rejected = _resolve_request_workspace(
             request, form_data.get("workspace")
@@ -880,6 +902,82 @@ def setup_chat_routes(
             _verify_session_owner(request, session)
             sess = session_manager.get_session(session)
             owner = effective_user(request)
+            persisted_security_mode = (
+                getattr(sess, "security_mode", None)
+                or get_session_security_mode(session)
+            )
+            if requested_security_mode not in (None, ""):
+                requested_security_mode = str(requested_security_mode).strip().lower()
+                if requested_security_mode not in {
+                    AgentRunMode.ASK.value,
+                    AgentRunMode.SANDBOX.value,
+                    AgentRunMode.FULL_ACCESS.value,
+                }:
+                    raise HTTPException(400, "Invalid agent security mode.")
+                effective_security_mode = parse_agent_run_mode(
+                    requested_security_mode
+                )
+            else:
+                effective_security_mode = parse_agent_run_mode(
+                    persisted_security_mode
+                )
+            if (
+                effective_security_mode is AgentRunMode.FULL_ACCESS
+                and not owner_is_admin_or_single_user(owner)
+            ):
+                if requested_security_mode not in (None, ""):
+                    raise HTTPException(
+                        403,
+                        "Full access agent mode requires an admin user.",
+                    )
+                effective_security_mode = AgentRunMode.SANDBOX
+            if tool_approval_id:
+                pending_approval = tool_approval_store.peek(tool_approval_id)
+                if (
+                    pending_approval is None
+                    or pending_approval.owner != str(owner or "").strip().casefold()
+                    or pending_approval.session_id != str(session)
+                ):
+                    raise HTTPException(
+                        409,
+                        "This tool approval is invalid, expired, or belongs to another thread.",
+                    )
+                decision = str(tool_approval_decision or "").strip().lower()
+                if decision not in {"approve", "deny"}:
+                    raise HTTPException(400, "Invalid tool approval decision.")
+                if (
+                    plan_mode
+                    or pending_approval.security_mode is not effective_security_mode
+                ):
+                    raise HTTPException(
+                        409,
+                        "The thread security state changed; review the action again.",
+                    )
+                exact_tool_approval = tool_approval_store.consume(
+                    tool_approval_id,
+                    decision=decision,
+                    owner=owner,
+                    session_id=session,
+                )
+                if decision == "approve" and exact_tool_approval is None:
+                    raise HTTPException(
+                        409,
+                        "This tool approval could not be consumed.",
+                    )
+                if decision == "approve":
+                    message = (
+                        f"Approved the exact {pending_approval.tool_name} action "
+                        "shown above once."
+                    )
+                    # The sealed server record, not mutable composer state,
+                    # chooses the approved action's original workspace.
+                    workspace = pending_approval.workspace or None
+                    workspace_rejected = None
+                else:
+                    message = (
+                        f"Denied the {pending_approval.tool_name} action shown above."
+                    )
+                chat_mode = "agent"
             _reconcile_selected_route_from_request(request, sess, session, form_data, owner=owner)
             if _clear_orphaned_session_endpoint(sess, owner=owner):
                 raise HTTPException(400, "Selected model endpoint was removed. Pick another model in Settings.")
@@ -1228,6 +1326,12 @@ def setup_chat_routes(
         _effective_mode = 'research' if effective_do_research else (chat_mode or 'chat')
         if _effective_mode in ('agent', 'research', 'chat'):
             set_session_mode(session, _effective_mode)
+        if (
+            requested_security_mode not in (None, "")
+            or effective_security_mode.value != persisted_security_mode
+        ):
+            set_session_security_mode(session, effective_security_mode.value)
+            sess.security_mode = effective_security_mode.value
 
         async def stream_with_save() -> AsyncGenerator[str, None]:
             # _effective_mode is read-only here; closure captures it from
@@ -1716,6 +1820,8 @@ def setup_chat_routes(
                         workspace=workspace or None,
                         forced_tools=_forced_tools,
                         uploaded_files=ctx.uploaded_files,
+                        security_mode=effective_security_mode.value,
+                        exact_approval=exact_tool_approval,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:

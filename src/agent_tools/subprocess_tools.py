@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import re
 import shutil
@@ -7,6 +8,12 @@ import time
 import collections
 from typing import Optional, Callable, Awaitable, Tuple, Dict
 from src.constants import MAX_OUTPUT_CHARS
+from src.execution_sandbox import (
+    environment_for_sandbox_launcher,
+    sandbox_command,
+    sandbox_python_executable,
+)
+from src.agent_run_policy import ExecutionProfile
 
 DEFAULT_BASH_TIMEOUT = 60 * 60     # 1 hour
 DEFAULT_PYTHON_TIMEOUT = 60 * 60
@@ -16,9 +23,21 @@ PROGRESS_TAIL_LINES = 12
 TMUX_CAPTURE_LINES = 2000
 
 
-def _tmux_session_name(session_id: Optional[str]) -> str:
+def _tmux_session_name(
+    session_id: Optional[str],
+    workspace: str = "",
+    execution_profile: str = ExecutionProfile.WORKSPACE_SANDBOX.value,
+) -> str:
     raw = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(session_id or "default")).strip("-")
-    return f"ody-agent-{raw[:80] or 'default'}"
+    workspace_key = hashlib.sha256(
+        os.path.realpath(workspace or ".").encode("utf-8", errors="replace")
+    ).hexdigest()[:10]
+    profile_tag = (
+        "host"
+        if execution_profile == ExecutionProfile.HOST_FULL_ACCESS.value
+        else "sbx"
+    )
+    return f"ody-agent-{profile_tag}-v1-{raw[:60] or 'default'}-{workspace_key}"
 
 
 async def _run_exec(*args: str, timeout: float = 10) -> Tuple[str, str, int]:
@@ -61,19 +80,17 @@ async def _tmux_send_line(name: str, line: str) -> None:
     await _run_exec("tmux", "send-keys", "-t", name, "C-m", timeout=5)
 
 
-async def _ensure_tmux_session(name: str, cwd: str, env: Optional[dict]) -> None:
+async def _ensure_tmux_session(
+    name: str,
+    cwd: str,
+    shell_argv: list[str],
+) -> None:
     if await _tmux_has_session(name):
         await _run_exec("tmux", "send-keys", "-t", name, "stty -echo", "C-m", timeout=5)
         return
     await _run_exec(
         "tmux", "new-session", "-d", "-s", name, "-c", cwd,
-        "env",
-        f"TERM={env.get('TERM', 'xterm-256color') if env else 'xterm-256color'}",
-        f"COLUMNS={env.get('COLUMNS', '120') if env else '120'}",
-        f"LINES={env.get('LINES', '40') if env else '40'}",
-        "/bin/bash",
-        "--noprofile",
-        "--norc",
+        *shell_argv,
         timeout=10,
     )
     if not await _tmux_has_session(name):
@@ -113,12 +130,19 @@ async def _run_tmux_bash(
     *,
     session_id: str,
     cwd: str,
-    env: Optional[dict],
     timeout: float,
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
+    execution_profile: str = ExecutionProfile.WORKSPACE_SANDBOX.value,
 ) -> Tuple[str, str, Optional[int], bool]:
-    name = _tmux_session_name(session_id)
-    await _ensure_tmux_session(name, cwd, env)
+    name = _tmux_session_name(session_id, cwd, execution_profile)
+    if execution_profile == ExecutionProfile.HOST_FULL_ACCESS.value:
+        shell_argv = ["/bin/bash", "--noprofile", "--norc"]
+    else:
+        shell_argv = sandbox_command(
+            ["/bin/bash", "--noprofile", "--norc"],
+            workspace=cwd,
+        )
+    await _ensure_tmux_session(name, cwd, shell_argv)
 
     stamp = f"{int(time.time() * 1000)}-{abs(hash(content)) % 1000000}"
     start_marker = f"__ODYSSEUS_CMD_START_{stamp}__"
@@ -278,16 +302,20 @@ class BashTool:
         if isinstance(content, dict):
             content = str(content.get("command") or content.get("cmd") or content.get("code") or "")
         progress_cb = ctx.get("progress_cb")
-        _subproc_env = ctx.get("subproc_env")
         session_id = ctx.get("session_id")
+        execution_profile = str(
+            ctx.get("execution_profile")
+            or ExecutionProfile.WORKSPACE_SANDBOX.value
+        )
+        workspace = agent_cwd()
         if session_id and shutil.which("tmux"):
             stdout, stderr, rc, timed_out = await _run_tmux_bash(
                 content,
                 session_id=str(session_id),
-                cwd=agent_cwd(),
-                env=_subproc_env,
+                cwd=workspace,
                 timeout=DEFAULT_BASH_TIMEOUT,
                 progress_cb=progress_cb,
+                execution_profile=execution_profile,
             )
             if timed_out:
                 return {
@@ -295,7 +323,9 @@ class BashTool:
                     "exit_code": 124,
                     "stdout": _truncate(stdout, MAX_OUTPUT_CHARS),
                     "stderr": _truncate(stderr, MAX_OUTPUT_CHARS),
-                    "tmux_session": _tmux_session_name(str(session_id)),
+                    "tmux_session": _tmux_session_name(
+                        str(session_id), workspace, execution_profile
+                    ),
                 }
             output = stdout.rstrip()
             err = stderr.rstrip()
@@ -304,15 +334,26 @@ class BashTool:
             return {
                 "output": _truncate(output, MAX_OUTPUT_CHARS) or "(no output)",
                 "exit_code": rc or 0,
-                "tmux_session": _tmux_session_name(str(session_id)),
+                "tmux_session": _tmux_session_name(
+                    str(session_id), workspace, execution_profile
+                ),
             }
 
-        proc = await asyncio.create_subprocess_shell(
-            content,
+        if execution_profile == ExecutionProfile.HOST_FULL_ACCESS.value:
+            argv = ["/bin/bash", "--noprofile", "--norc", "-c", content]
+            process_env = None
+        else:
+            argv = sandbox_command(
+                ["/bin/bash", "--noprofile", "--norc", "-c", content],
+                workspace=workspace,
+            )
+            process_env = environment_for_sandbox_launcher()
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_subproc_env,
-            cwd=agent_cwd(),
+            env=process_env,
+            cwd=workspace,
         )
         stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
             proc,
@@ -332,13 +373,26 @@ class PythonTool:
     async def execute(self, content: str, ctx: dict) -> dict:
         from src.tool_execution import agent_cwd, _truncate
         progress_cb = ctx.get("progress_cb")
-        _subproc_env = ctx.get("subproc_env")
+        execution_profile = str(
+            ctx.get("execution_profile")
+            or ExecutionProfile.WORKSPACE_SANDBOX.value
+        )
+        workspace = agent_cwd()
+        if execution_profile == ExecutionProfile.HOST_FULL_ACCESS.value:
+            argv = [sys.executable, "-I", "-c", content]
+            process_env = None
+        else:
+            argv = sandbox_command(
+                [sandbox_python_executable(), "-I", "-c", content],
+                workspace=workspace,
+            )
+            process_env = environment_for_sandbox_launcher()
         proc = await asyncio.create_subprocess_exec(
-            (sys.executable or "python"), "-I", "-c", content,
+            *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_subproc_env,
-            cwd=agent_cwd(),
+            env=process_env,
+            cwd=workspace,
         )
         stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
             proc,

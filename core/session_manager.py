@@ -134,6 +134,7 @@ class SessionManager:
             history=[],
             owner=getattr(db_session, "owner", None),
             is_important=getattr(db_session, "is_important", False) or False,
+            security_mode=getattr(db_session, "security_mode", None) or "sandbox",
         )
         session.message_count = getattr(db_session, "message_count", 0) or 0
         return session
@@ -192,6 +193,7 @@ class SessionManager:
             history=history,
             owner=getattr(db_session, 'owner', None),
             is_important=getattr(db_session, 'is_important', False) or False,
+            security_mode=getattr(db_session, "security_mode", None) or "sandbox",
         )
 
         session.message_count = getattr(db_session, 'message_count', len(history))
@@ -445,6 +447,9 @@ class SessionManager:
             session.owner = getattr(db_session, "owner", None)
             session.is_important = getattr(db_session, "is_important", False) or False
             session.message_count = getattr(db_session, "message_count", session.message_count) or 0
+            session.security_mode = (
+                getattr(db_session, "security_mode", None) or "sandbox"
+            )
             return True
         except Exception as e:
             logger.error(f"Error syncing session metadata {session_id}: {e}")
@@ -513,6 +518,7 @@ class SessionManager:
                 rag=rag,
                 headers={},
                 owner=owner,
+                security_mode="sandbox",
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc)
             )
@@ -527,6 +533,7 @@ class SessionManager:
                 rag=rag,
                 headers={},
                 owner=owner,
+                security_mode="sandbox",
             )
 
             self.sessions[session_id] = session
