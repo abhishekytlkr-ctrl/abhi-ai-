@@ -25,6 +25,11 @@ from src.settings import get_setting
 from src.prompt_security import untrusted_context_message
 from src.tool_security import blocked_tools_for_owner, plan_mode_disabled_tools
 from src.tool_policy import GUIDE_ONLY_DIRECTIVE, WEB_TOOL_NAMES, ToolPolicy
+from src.tool_capabilities import (
+    ToolRunSecurityContext,
+    blocked_tool_result,
+    messages_contain_external_untrusted_context,
+)
 from src.tool_utils import _truncate, get_mcp_manager
 from src.agent_tools import (
     parse_tool_blocks,
@@ -3101,6 +3106,7 @@ async def stream_agent_loop(
     forced_tools: Optional[Set[str]] = None,
     uploaded_files: Optional[List[Dict]] = None,
     workload: str = "foreground",
+    external_untrusted_context_seen: bool = False,
     _is_teacher_run: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
@@ -3114,6 +3120,12 @@ async def stream_agent_loop(
       - data: [DONE]                                        (end)
     """
 
+    run_security = ToolRunSecurityContext(
+        external_untrusted_context_seen=(
+            bool(external_untrusted_context_seen)
+            or messages_contain_external_untrusted_context(messages)
+        )
+    )
     mcp_mgr = get_mcp_manager()
     prep_timings: Dict[str, float] = {}
     disabled_tools = set(disabled_tools or [])
@@ -3942,6 +3954,14 @@ async def stream_agent_loop(
             _last_content = _last_user.lower()
             _wants_mcp = any(kw in _last_content for kw in _MCP_KEYWORDS)
             all_tool_schemas = mcp_schemas if (_wants_mcp and mcp_schemas) else []
+        if run_security.external_untrusted_context_seen and all_tool_schemas:
+            all_tool_schemas = [
+                schema
+                for schema in all_tool_schemas
+                if run_security.decision_for(
+                    (schema.get("function") or {}).get("name") or schema.get("name")
+                ).allowed
+            ]
         agent_stream_timeout = int(get_setting("agent_stream_timeout_seconds", 300) or 300)
 
         _tool_names_sent = [t.get("function", {}).get("name") for t in (all_tool_schemas or []) if t.get("function")]
@@ -4621,11 +4641,21 @@ async def stream_agent_loop(
             else:
                 cmd_display = full_command
 
+            security_decision = run_security.decision_for(block.tool_type)
             _ody_clamped_tool_allowed = (
                 _ody_notes_finetune_mode
                 and block.tool_type in {"manage_notes", "manage_calendar", "manage_tasks"}
             )
-            if tool_policy and tool_policy.blocks(block.tool_type) and not _ody_clamped_tool_allowed:
+            if not security_decision.allowed:
+                desc, result = blocked_tool_result(
+                    block.tool_type,
+                    security_decision.reason or "Tool blocked by external-context policy.",
+                )
+                logger.info(
+                    "Tool blocked before start by external-context policy: %s",
+                    block.tool_type,
+                )
+            elif tool_policy and tool_policy.blocks(block.tool_type) and not _ody_clamped_tool_allowed:
                 desc = f"{block.tool_type}: BLOCKED"
                 result = {
                     "error": tool_policy.reason_for(block.tool_type),
@@ -4657,6 +4687,7 @@ async def stream_agent_loop(
                             owner=owner,
                             progress_cb=_push_progress,
                             workspace=workspace,
+                            security_context=run_security,
                         )
                     finally:
                         # Sentinel so the drainer knows to stop.
@@ -4688,6 +4719,8 @@ async def stream_agent_loop(
                             await _tool_task
                         except (asyncio.CancelledError, Exception):
                             pass
+
+            run_security.observe_tool_result(block.tool_type, result)
 
             # A skill the model just loaded can prescribe tools that weren't
             # RAG-selected this turn (declared via requires_toolsets in its
