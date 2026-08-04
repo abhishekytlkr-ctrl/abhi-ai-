@@ -28,6 +28,7 @@ from src.endpoint_resolver import (
     build_chat_url,
     build_models_url,
     build_headers,
+    resolve_endpoint_runtime,
 )
 from src.auth_helpers import _auth_disabled, effective_user, owner_filter
 
@@ -46,10 +47,12 @@ _ENDPOINT_SETTING_FIELDS = {
 }
 
 _ENDPOINT_FALLBACK_FIELDS = {
-    "default_model_fallbacks": "Default Model Fallbacks",
+    "foreground_model_fallbacks": "Foreground Model Fallbacks",
     "utility_model_fallbacks": "Utility Model Fallbacks",
     "vision_model_fallbacks":  "Vision Model Fallbacks",
 }
+# `default_model_fallbacks` is intentionally absent. The legacy data remains
+# stored as-is even when an endpoint is removed, but no longer affects routing.
 
 
 def _speech_settings_using_endpoint(settings: dict, ep_id: str) -> list:
@@ -179,7 +182,12 @@ def _clear_user_pref_endpoint_refs(all_prefs: dict, ep_id: str) -> int:
     if not isinstance(all_prefs, dict):
         return 0
     users = all_prefs.get("_users")
-    pref_sets = users.values() if isinstance(users, dict) else [all_prefs]
+    # A mixed store can contain auth-disabled foreground policy at the root
+    # alongside named-owner preferences. Both are active namespaces; legacy
+    # `default_model_fallbacks` remains untouched by the field allowlist.
+    pref_sets = [all_prefs]
+    if isinstance(users, dict):
+        pref_sets.extend(users.values())
     cleared_users = 0
     for prefs in pref_sets:
         if isinstance(prefs, dict) and _clear_endpoint_settings_for_endpoint(prefs, ep_id):
@@ -1559,6 +1567,16 @@ def setup_model_routes(model_discovery):
             base = _normalize_base(ep.base_url)
             provider = _safe_detect_provider(base)
             ep_model_type = getattr(ep, "model_type", None) or "llm"
+            configured_model_ids = _merge_model_ids(
+                _cached_model_ids(ep),
+                _normalize_model_ids(getattr(ep, "pinned_models", None)),
+                _normalize_model_ids(getattr(ep, "hidden_models", None)),
+            )
+            model_ids = _visible_models(
+                _cached_model_ids(ep),
+                ep.hidden_models,
+                getattr(ep, "pinned_models", None),
+            )
             # Build correct URL based on provider
             chat_url = build_chat_url(base)
             kind = _effective_endpoint_kind(ep, base)
@@ -1587,6 +1605,7 @@ def setup_model_routes(model_discovery):
                     "category": category,
                     "endpoint_kind": kind,
                     "model_type": ep_model_type,
+                    "_foreground_model_catalog_unknown": False,
                 })
             else:
                 # Endpoint unreachable but still show it greyed out
@@ -1604,12 +1623,147 @@ def setup_model_routes(model_discovery):
                     "endpoint_kind": kind,
                     "model_type": ep_model_type,
                     "offline": True,
+                    "_foreground_model_catalog_unknown": not bool(configured_model_ids),
                 })
 
         return {"hosts": [], "items": items}
 
+    def _foreground_catalog_allowed_models(request: Request, owner: str):
+        """Return the caller's foreground model allowlist, if restricted."""
+
+        if not owner:
+            return None
+        auth_mgr = getattr(getattr(request, "app", None), "state", None)
+        auth_mgr = getattr(auth_mgr, "auth_manager", None)
+        if auth_mgr is None:
+            return None
+        try:
+            privileges = auth_mgr.get_privileges(owner) or {}
+        except Exception:
+            # The runtime policy fails closed if it cannot resolve privileges.
+            # Keep the editor equally conservative instead of offering models
+            # whose credentials it may not be allowed to resolve.
+            return frozenset()
+        if privileges.get("block_all_models"):
+            return frozenset()
+        raw = privileges.get("allowed_models")
+        allowed = raw if isinstance(raw, list) else []
+        restricted = bool(privileges.get("allowed_models_restricted")) or bool(allowed)
+        if not restricted:
+            return None
+        return frozenset(model for model in allowed if isinstance(model, str))
+
+    def _foreground_runtime_endpoint_ids(
+        owner: str,
+        candidate_endpoint_ids: set[str],
+    ) -> set[str]:
+        """Return owner-visible LLM endpoints whose runtime route resolves now."""
+
+        if not candidate_endpoint_ids:
+            return set()
+        db = SessionLocal()
+        try:
+            query = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)
+            if owner:
+                query = owner_filter(query, ModelEndpoint, owner)
+            endpoint_ids = set()
+            for endpoint in query.all():
+                if endpoint.id not in candidate_endpoint_ids:
+                    continue
+                if (getattr(endpoint, "model_type", None) or "llm") != "llm":
+                    continue
+                try:
+                    base_url, _api_key = resolve_endpoint_runtime(
+                        endpoint,
+                        owner=owner or None,
+                    )
+                except Exception:
+                    # Match exact fallback resolution: a provider-auth route
+                    # whose current credentials cannot resolve is not offered
+                    # as an eligible concrete candidate. Never expose the
+                    # credential failure or secret material in this feed.
+                    continue
+                if base_url:
+                    endpoint_ids.add(endpoint.id)
+            return endpoint_ids
+        finally:
+            db.close()
+
+    def _foreground_catalog_result(
+        result: dict,
+        allowed_models,
+        owner: str,
+    ) -> dict:
+        """Copy the safe model feed and apply foreground-only constraints."""
+
+        if allowed_models is not None and not allowed_models:
+            return {"hosts": [], "items": []}
+        prepared_items = []
+        runtime_candidates = set()
+        for source in result.get("items", []):
+            if not isinstance(source, dict):
+                continue
+            if (source.get("model_type") or "llm") != "llm":
+                continue
+            item = dict(source)
+            catalog_unknown = item.pop(
+                "_foreground_model_catalog_unknown",
+                False,
+            ) is True
+            for key, display_key in (
+                ("models", "models_display"),
+                ("models_extra", "models_extra_display"),
+            ):
+                models = item.get(key) if isinstance(item.get(key), list) else []
+                if allowed_models is not None:
+                    models = [model for model in models if model in allowed_models]
+                item[key] = models
+                item[display_key] = [_model_display_name(model) for model in models]
+            item["model_catalog_unknown"] = catalog_unknown
+            item["allowed_unknown_models"] = (
+                sorted(allowed_models)
+                if catalog_unknown and allowed_models is not None
+                else None
+            )
+            potentially_eligible = bool(
+                item.get("models")
+                or item.get("models_extra")
+                or catalog_unknown
+            )
+            if potentially_eligible:
+                runtime_candidates.add(item.get("endpoint_id"))
+            prepared_items.append((item, potentially_eligible))
+        runtime_endpoint_ids = _foreground_runtime_endpoint_ids(
+            owner,
+            runtime_candidates,
+        )
+        items = [
+            item
+            for item, potentially_eligible in prepared_items
+            if not potentially_eligible
+            or item.get("endpoint_id") in runtime_endpoint_ids
+        ]
+        return {"hosts": [], "items": items}
+
+    def _public_model_result(result: dict) -> dict:
+        """Strip foreground-only cache metadata from the ordinary picker feed."""
+
+        items = []
+        for source in result.get("items", []):
+            if not isinstance(source, dict):
+                continue
+            item = dict(source)
+            item.pop("_foreground_model_catalog_unknown", None)
+            items.append(item)
+        return {"hosts": result.get("hosts", []), "items": items}
+
     @router.get("/models")
-    def api_models(request: Request, refresh: bool = False, background: bool = False):
+    def api_models(
+        request: Request,
+        refresh: bool = False,
+        background: bool = False,
+        foreground_fallback: bool = False,
+    ):
         """Get available models — per-user (caller sees only their endpoints +
         legacy/shared null-owner rows). Cached per-user for 30s."""
         # Require auth; "" is the unconfigured single-user mode, treated as
@@ -1645,18 +1799,32 @@ def setup_model_routes(model_discovery):
         now = _time.time()
         # Cache key includes the admin flag so a demotion / promotion doesn't
         # serve the wrong scoped view from cache.
-        _cache_key = (owner, _is_admin)
+        # The foreground Settings editor must mirror the runtime resolver's
+        # exact owner boundary, including for admins. The ordinary picker keeps
+        # its historical admin-wide inventory behavior.
+        catalog_is_admin = _is_admin and not foreground_fallback
+        _cache_key = (owner, catalog_is_admin)
         cache_entry = _models_cache.get(_cache_key)
         if not refresh and cache_entry is not None and (now - cache_entry["time"]) < _MODELS_CACHE_TTL:
-            return cache_entry["data"]
-        result = _fetch_models(owner=owner, is_admin=_is_admin)
-        _models_cache[_cache_key] = {"data": result, "time": now}
+            result = cache_entry["data"]
+        else:
+            result = _fetch_models(owner=owner, is_admin=catalog_is_admin)
+            _models_cache[_cache_key] = {"data": result, "time": now}
         # Kick off background refresh to update caches from live endpoints.
         # Page boot can opt out with background=false so opening Odysseus does
         # not start endpoint probes against slow/offline model servers.
         if background or refresh:
             _refresh_caches_bg(force=refresh)
-        return result
+        if foreground_fallback:
+            allowed_models = _foreground_catalog_allowed_models(request, owner)
+            if allowed_models is not None and not allowed_models:
+                return {"hosts": [], "items": []}
+            return _foreground_catalog_result(
+                result,
+                allowed_models,
+                owner,
+            )
+        return _public_model_result(result)
 
     # Brief cache for local-probe results so picker-open doesn't hammer
     # endpoint health checks every time. 8s TTL — long enough to amortize cost,
@@ -2437,7 +2605,6 @@ def setup_model_routes(model_discovery):
             _user_prefs = _load_for_user(_user) or {}
             ep_id = (_user_prefs.get("default_endpoint_id") or "").strip()
             model = (_user_prefs.get("default_model") or "").strip()
-            _fallbacks = _user_prefs.get("default_model_fallbacks") or []
             # If user has no personal default, fall back to global default
             # But only based on the "share_defaults_with_users" flag
             # (only if share_defaults_with_users is enabled)
@@ -2446,12 +2613,9 @@ def setup_model_routes(model_discovery):
                     ep_id = settings.get("default_endpoint_id", "")
                 if not model:
                     model = settings.get("default_model", "")
-                if not _fallbacks:
-                    _fallbacks = settings.get("default_model_fallbacks") or []
         else:
             ep_id = settings.get("default_endpoint_id", "")
             model = settings.get("default_model", "")
-            _fallbacks = settings.get("default_model_fallbacks") or []
         db = SessionLocal()
         try:
             ep = None
@@ -2466,33 +2630,6 @@ def setup_model_routes(model_discovery):
                 if _user and not _is_admin:
                     ep_q = owner_filter(ep_q, ModelEndpoint, _user)
                 ep = ep_q.first()
-            # Configured fallback chain — when the chosen default endpoint is
-            # gone/disabled, honor the user's configured `default_model_fallbacks`
-            # in order BEFORE arbitrarily grabbing the first enabled endpoint.
-            # (Previously this jumped straight to "first enabled", which is why
-            # deleting/changing the main endpoint silently reassigned the default
-            # chat to some unrelated endpoint instead of the fallback.)
-            if not ep:
-                for entry in _fallbacks:
-                    if not isinstance(entry, dict):
-                        continue
-                    fid = (entry.get("endpoint_id") or "").strip()
-                    if not fid:
-                        continue
-                    cand_q = db.query(ModelEndpoint).filter(
-                        ModelEndpoint.id == fid, ModelEndpoint.is_enabled == True
-                    )
-                    if _user and not _is_admin:
-                        cand_q = owner_filter(cand_q, ModelEndpoint, _user)
-                    cand = cand_q.first()
-                    if cand:
-                        ep = cand
-                        # Use the fallback entry's model. Reset even when empty
-                        # so we don't carry the prior endpoint's stale model onto
-                        # this fallback — the cached-models lookup below then
-                        # fills it from the fallback endpoint.
-                        model = (entry.get("model") or "").strip()
-                        break
             # Last resort: first enabled endpoint owned by THIS user. Do not
             # include null-owner/shared endpoints here: a brand-new user with
             # no explicit default should not auto-open a pending chat using an
