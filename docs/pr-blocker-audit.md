@@ -181,8 +181,8 @@ Dirty, blocked, conflicting, and unknown merge states are shown as risk/caution 
 ## Validation
 
 ```bash
-python3 -m py_compile scripts/pr_blocker_audit.py tests/test_pr_blocker_audit.py
-python3 -m pytest tests/test_pr_blocker_audit.py -q
+venv/bin/python -m py_compile scripts/pr_blocker_audit.py tests/test_pr_blocker_audit.py
+venv/bin/python -m pytest tests/test_pr_blocker_audit.py -q
 python3 scripts/pr_blocker_audit.py --help
 git diff --check
 ```

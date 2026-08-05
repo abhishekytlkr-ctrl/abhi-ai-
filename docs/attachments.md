@@ -1,7 +1,13 @@
 # Attachment References and Upload Storage
 
-Odysseus stores uploaded bytes once under the configured upload directory and
-passes stable references through chat history, tools, and future artifact work.
+> [!NOTE]
+> This document records the current attachment-reference and upload-lifecycle
+> contract proposed for maintainer acceptance. Source code, tests, and
+> configuration remain authoritative for implementation-sensitive behaviour.
+
+Odysseus stores chat and document attachment bytes under the configured upload
+directory and passes stable references through chat history, document flows, and
+tool context.
 The goal is to avoid duplicating large inline media payloads in
 `chat_messages.content` or the SQLite FTS index.
 
@@ -53,6 +59,32 @@ only after all of these checks pass:
 External MCP/custom tools should treat the URI and attachment ID as the stable
 contract and request bytes through an owner-checked server path, not by assuming
 host filesystem layout.
+
+## Implementation evidence
+
+The current contract is implemented primarily through:
+
+- `src/upload_handler.py` for upload metadata, owner-aware resolution,
+  reservations, cleanup, and deletion;
+- `src/attachment_refs.py` for compact persisted references and search-index
+  sanitization;
+- `src/document_processor.py` for resolving attachments into chat/model context;
+- `src/tool_execution.py` for attachment manifests exposed to tools;
+- `routes/upload_routes.py` and `routes/document_helpers.py` for upload and
+  retrieval paths.
+
+Focused regression coverage includes:
+
+- `tests/test_attachment_refs.py`;
+- `tests/test_upload_handler_cleanup.py`;
+- `tests/test_replace_messages_upload_reservations.py`;
+- `tests/test_resolve_upload_path_nondict.py`;
+- `tests/test_chat_preprocess_tool_policy.py`;
+- the upload, attachment, and PDF-marker cases in
+  `tests/test_security_regressions.py`.
+
+These tests cover compact persistence, owner isolation, path containment,
+cleanup safety, reservation-before-write behaviour, and traversal resistance.
 
 ## Retention and Deletion
 

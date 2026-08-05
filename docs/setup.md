@@ -1,6 +1,28 @@
 # Odysseus Setup Guide
 
-This page keeps the detailed install, deployment, troubleshooting, and configuration notes out of the front README.
+This guide covers installation, deployment, troubleshooting, and configuration.
+For a minimal Docker installation, start with the
+[repository README](../README.md#quick-start).
+
+## On this page
+
+- [Quick Start](#quick-start)
+  - [Docker](#docker-recommended)
+  - [Native Linux and macOS](#native-linux--macos)
+  - [Apple Silicon](#apple-silicon)
+  - [Native Windows](#native-windows)
+- [Troubleshooting and advanced setup](#troubleshooting--advanced-setup)
+- [Security notes](#security-notes)
+- [Configuration](#configuration)
+- [Architecture](#architecture)
+- [Data and backups](#data)
+
+Related guidance:
+
+- [Security policy](../SECURITY.md)
+- [Architecture overview](ARCHITECTURE.md)
+- [Backup and restore guide](backup-restore.md)
+- [Contributing guide](../CONTRIBUTING.md)
 
 ## Quick Start
 
@@ -15,8 +37,8 @@ On first setup, Odysseus creates an admin account (`admin` unless
 For Docker installs, the same line is in `docker compose logs odysseus`.
 Use that for the first login, then change it in **Settings**.
 
-Contributing? See [CONTRIBUTING.md](../CONTRIBUTING.md) for setup, testing, and
-pull request guidelines.
+Contributing? See the [contributing guide](../CONTRIBUTING.md) for development
+setup, testing, and pull request guidelines.
 
 ### Docker (recommended)
 ```bash
@@ -441,8 +463,8 @@ uv pip sync requirements.lock                          # reproduce it exactly la
 ### Outlook / Office 365 email
 Odysseus email accounts currently use IMAP/SMTP username-password auth. Outlook
 and Microsoft 365 generally require OAuth instead, so normal Microsoft mailbox
-passwords will fail. See [docs/email-outlook.md](docs/email-outlook.md) for the
-current limitation and the planned integration direction.
+passwords will fail. See the [Outlook and Microsoft 365 email guide](email-outlook.md)
+for the current limitation and planned integration direction.
 
 ## Security Notes
 Odysseus is a self-hosted workspace with powerful local tools: shell access, file uploads, model downloads, web research, email/calendar integrations, and API tokens. Treat it like an admin console.
@@ -530,19 +552,16 @@ npx -y @playwright/mcp@latest --version
 That installs `@playwright/mcp` plus Playwright (~300MB total). Restart Odysseus and the server will register at startup.
 
 ## Architecture
-```
-app.py                   # FastAPI entry point
-core/      auth, database, middleware, constants
-src/       llm_core, agent_loop, agent_tools, chat_processor, search/
-routes/    chat, session, document, memory, model … endpoints
-services/  docs, memory, search, hwfit (Cookbook) …
-static/    index.html + app.js + style.css + js/ (modular front-end)
-docs/      landing page (index.html) + preview clips
-```
+
+For stable high-level runtime structure, subsystem boundaries, and documentation
+authority, see the [architecture overview](ARCHITECTURE.md).
+
+Source code, tests, and configuration remain authoritative for
+implementation-sensitive behaviour.
 
 ## Data
 All user data lives in `data/` (gitignored): `app.db` (sessions, messages, documents),
 `memory.json`, `presets.json`, `uploads/`, `personal_docs/`, `chroma/`, `settings.json`.
 
-To back up or restore everything in `data/`, see the
-[Backup & Restore guide](backup-restore.md).
+To protect or recover this data, follow the
+[backup and restore guide](backup-restore.md).

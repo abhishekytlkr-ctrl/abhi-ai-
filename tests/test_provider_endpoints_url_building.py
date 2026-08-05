@@ -1,8 +1,8 @@
 """Provider endpoint URL-building tests.
 
-Covers ``build_chat_url`` and ``build_models_url`` for every provider named in
-ROADMAP.md: Anthropic, Gemini, Groq, xAI, OpenRouter, OpenAI, DeepSeek, Ollama
-(local + cloud).
+Covers ``build_chat_url`` and ``build_models_url`` for the provider families
+exercised by this module: Anthropic, Gemini, Groq, xAI, OpenRouter, OpenAI,
+DeepSeek, and Ollama (local and cloud).
 """
 import pytest
 

@@ -1,3 +1,5 @@
+# Odysseus
+
 <p align="center">
   <img src="docs/odysseus-wordmark.png" alt="Odysseus" width="238">
 </p>
@@ -9,6 +11,8 @@
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
   <a href="docs/setup.md">Setup Guide</a> ·
+  <a href="docs/ARCHITECTURE.md">Architecture</a> ·
+  <a href="SECURITY.md">Security</a> ·
   <a href="CONTRIBUTING.md">Contributing</a> ·
   <a href="ROADMAP.md">Roadmap</a>
 </p>
@@ -51,15 +55,15 @@ Native installs, GPU notes, Windows/macOS instructions, HTTPS, and configuration
 
 ## Demo
 
-A full hover-to-play tour lives on the landing page: [`docs/index.html`](docs/index.html).
+Explore the interface through the [interactive product tour](docs/index.html).
 
 ## Contributing
 
-Help is welcome. The best entry points are fresh-install testing, provider setup bugs, mobile/editor polish, docs, and small focused refactors. See [CONTRIBUTING.md](CONTRIBUTING.md) and [ROADMAP.md](ROADMAP.md).
+Help is welcome. The best entry points are fresh-install testing, provider setup bugs, mobile/editor polish, documentation, and small focused refactors. Read the [contributing guide](CONTRIBUTING.md), review the [public roadmap](ROADMAP.md), and browse the open [GitHub issues](https://github.com/odysseus-dev/odysseus/issues).
 
 ## Security
 
-Odysseus is a self-hosted workspace with powerful local tools. Keep auth enabled, keep private data out of Git, and do not expose raw model/service ports publicly. Deployment details are in the [setup guide](docs/setup.md#security-notes).
+Odysseus is a self-hosted workspace with powerful local tools. Keep auth enabled, keep private data out of Git, and do not expose raw model or service ports publicly. Read the [security policy](SECURITY.md) and the [deployment security guidance](docs/setup.md#security-notes).
 
 ## Star History
 
@@ -73,4 +77,4 @@ Odysseus is a self-hosted workspace with powerful local tools. Keep auth enabled
 
 ## License
 
-AGPL-3.0-or-later -- see [LICENSE](LICENSE) and [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md).
+Licensed under AGPL-3.0-or-later. See the [license](LICENSE) and [acknowledgments](ACKNOWLEDGMENTS.md).

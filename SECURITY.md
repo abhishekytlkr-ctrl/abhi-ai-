@@ -37,4 +37,6 @@ Only `.env.example`, docs, source, tests, and static assets should be committed.
 
 ## Reporting
 
-Please report vulnerabilities privately via GitHub security advisories if available, or by opening a minimal issue that does not disclose exploit details.
+Report security vulnerabilities privately through [GitHub Security Advisories](https://github.com/odysseus-dev/odysseus/security/advisories/new).
+
+Do not open a public issue or discussion, and do not disclose exploit details publicly.
